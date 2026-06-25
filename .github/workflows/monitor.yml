@@ -1,0 +1,43 @@
+name: Plan A monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: plan-a-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      - name: Run monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          X_BEARER_TOKEN:    ${{ secrets.X_BEARER_TOKEN }}
+          REDDIT_CLIENT_ID:  ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+        run: python planamonitor.py --config config.cloud.yaml
+      - name: Save state + dashboard data
+        run: |
+          git config user.name  "plan-a-monitor"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A seen_ids.json alerted.json run_history.json timeseries.json 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "no state changes"
+          else
+            git commit -m "monitor state $(date -u +%FT%TZ)"
+            git pull --rebase --autostash || true
+            git push
+          fi
