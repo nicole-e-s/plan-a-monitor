@@ -1,0 +1,995 @@
+#!/usr/bin/env python3
+"""Plan A Monitor — single-file build (all modules combined)."""
+from __future__ import annotations
+import argparse, base64, json, os, re, sys, time, urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from typing import Optional
+
+# ===== from sources.py =====
+
+
+
+
+# --------------------------------------------------------------------------
+# Common shape every source produces
+# --------------------------------------------------------------------------
+@dataclass
+class Mention:
+    platform: str                 # "twitter" | "reddit" | "hackernews"
+    id: str                       # unique id within the platform
+    url: str
+    text: str
+    author: str = ""              # handle or username
+    author_name: str = ""         # display name (twitter)
+    author_followers: Optional[int] = None
+    author_verified: bool = False
+    created_at: Optional[datetime] = None
+    engagement: int = 0           # single comparable number (see _engagement)
+    metrics: dict = field(default_factory=dict)   # raw platform metrics
+
+    # filled in later by the relevance/scoring stages:
+    confidence: str = "medium"    # high | medium | low (rule-based)
+    relevant: Optional[bool] = None
+    sentiment: str = "unknown"    # positive | neutral | negative | mixed
+    stance: str = ""              # supportive | substantive_critique | dismissive | question | news_share | off_topic
+    theme: str = ""               # short cluster label
+    summary: str = ""             # one-line AI summary
+    priority: float = 0.0
+    tier: str = "low"             # critical | high | low
+
+
+def _get_json(url: str, headers: dict | None = None, timeout: int = 15):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+# --------------------------------------------------------------------------
+# Hacker News  (free, no auth — via the Algolia search API)
+# --------------------------------------------------------------------------
+def fetch_hackernews(terms: list[str], since: datetime, limit: int = 100) -> list[Mention]:
+    out: list[Mention] = []
+    since_ts = int(since.timestamp())
+    for term in terms:
+        # search both stories and comments, EXACT PHRASE only (advancedSyntax +
+        # quotes) so HN's fuzzy matcher doesn't flood us with generic AI chatter.
+        q = urllib.parse.quote(f'"{term}"')
+        url = (f"https://hn.algolia.com/api/v1/search_by_date?query={q}&advancedSyntax=true"
+               f"&tags=(story,comment)&numericFilters=created_at_i>{since_ts}"
+               f"&hitsPerPage={limit}")
+        try:
+            data = _get_json(url)
+        except Exception as e:
+            print(f"  [HN] error for '{term}': {e}")
+            continue
+        for h in data.get("hits", []):
+            is_comment = h.get("comment_text") is not None
+            text = h.get("comment_text") or h.get("title") or h.get("story_text") or ""
+            oid = str(h.get("objectID"))
+            article_url = h.get("url")     # external link for link-style submissions
+            domain = urllib.parse.urlparse(article_url).netloc.replace("www.", "") if article_url else ""
+            out.append(Mention(
+                platform="hackernews",
+                id=oid,
+                url=f"https://news.ycombinator.com/item?id={oid}",
+                text=text,
+                author=h.get("author", ""),
+                created_at=datetime.fromtimestamp(h.get("created_at_i", since_ts), timezone.utc),
+                engagement=int(h.get("points") or 0) + int(h.get("num_comments") or 0),
+                metrics={"points": h.get("points") or 0,
+                         "num_comments": h.get("num_comments") or 0,
+                         "type": "comment" if is_comment else "story",
+                         "article_url": article_url, "domain": domain},
+            ))
+        time.sleep(0.3)   # be polite
+    return out
+
+
+# --------------------------------------------------------------------------
+# Reddit  (free, but needs a script app: client_id + secret -> OAuth token)
+# --------------------------------------------------------------------------
+def _reddit_token(client_id: str, client_secret: str, user_agent: str) -> str:
+    data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    req = urllib.request.Request(
+        "https://www.reddit.com/api/v1/access_token",
+        data=data,
+        headers={"Authorization": f"Basic {basic}", "User-Agent": user_agent},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)["access_token"]
+
+
+def fetch_reddit(terms: list[str], since: datetime, cfg: dict, limit: int = 100) -> list[Mention]:
+    try:
+        token = _reddit_token(cfg["client_id"], cfg["client_secret"], cfg["user_agent"])
+    except Exception as e:
+        print(f"  [Reddit] auth failed ({e}); skipping Reddit this run.")
+        return []
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": cfg["user_agent"]}
+    out: list[Mention] = []
+    for term in terms:
+        q = urllib.parse.quote(f'"{term}"')
+        url = (f"https://oauth.reddit.com/search?q={q}&sort=new&limit={limit}"
+               f"&type=link,comment&restrict_sr=false")
+        try:
+            data = _get_json(url, headers=headers)
+        except Exception as e:
+            print(f"  [Reddit] error for '{term}': {e}")
+            continue
+        for c in data.get("data", {}).get("children", []):
+            d = c.get("data", {})
+            created = datetime.fromtimestamp(d.get("created_utc", 0), timezone.utc)
+            if created < since:
+                continue
+            text = d.get("selftext") or d.get("title") or d.get("body") or ""
+            perma = d.get("permalink", "")
+            out.append(Mention(
+                platform="reddit",
+                id=str(d.get("name") or d.get("id")),
+                url=f"https://www.reddit.com{perma}" if perma else d.get("url", ""),
+                text=(d.get("title", "") + "\n" + text).strip(),
+                author=d.get("author", ""),
+                created_at=created,
+                engagement=int(d.get("score") or 0) + int(d.get("num_comments") or 0),
+                metrics={"score": d.get("score") or 0,
+                         "num_comments": d.get("num_comments") or 0,
+                         "subreddit": d.get("subreddit", "")},
+            ))
+        time.sleep(0.5)
+    return out
+
+
+# --------------------------------------------------------------------------
+# X / Twitter  (X API v2 recent search — needs a paid bearer token)
+# --------------------------------------------------------------------------
+def fetch_twitter(terms: list[str], since: datetime, cfg: dict) -> list[Mention]:
+    token = cfg.get("bearer_token", "")
+    if not token or token == "FILL IN":
+        print("  [X] no bearer token configured; skipping X this run.")
+        return []
+    headers = {"Authorization": f"Bearer {token}"}
+    max_results = int(cfg.get("max_results", 100))
+    # one combined OR query keeps us under the request cap
+    query = " OR ".join(f'"{t}"' for t in terms) + " -is:retweet lang:en"
+    params = urllib.parse.urlencode({
+        "query": query,
+        "max_results": min(max(max_results, 10), 100),
+        "tweet.fields": "created_at,public_metrics,author_id",
+        "expansions": "author_id",
+        "user.fields": "username,name,verified,public_metrics",
+        "start_time": since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    url = f"https://api.twitter.com/2/tweets/search/recent?{params}"
+    try:
+        data = _get_json(url, headers=headers)
+    except Exception as e:
+        print(f"  [X] error: {e}")
+        return []
+    users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+    out: list[Mention] = []
+    for t in data.get("data", []):
+        u = users.get(t.get("author_id"), {})
+        pm = t.get("public_metrics", {})
+        upm = u.get("public_metrics", {})
+        handle = u.get("username", "")
+        out.append(Mention(
+            platform="twitter",
+            id=t["id"],
+            url=f"https://x.com/{handle}/status/{t['id']}" if handle else f"https://x.com/i/status/{t['id']}",
+            text=t.get("text", ""),
+            author=f"@{handle}" if handle else "",
+            author_name=u.get("name", ""),
+            author_followers=upm.get("followers_count"),
+            author_verified=bool(u.get("verified")),
+            created_at=datetime.strptime(t["created_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                if t.get("created_at") else None,
+            engagement=int(pm.get("like_count", 0)) + 2 * int(pm.get("retweet_count", 0)) + int(pm.get("quote_count", 0)),
+            metrics={"likes": pm.get("like_count", 0), "reposts": pm.get("retweet_count", 0),
+                     "quotes": pm.get("quote_count", 0), "replies": pm.get("reply_count", 0)},
+        ))
+    return out
+
+
+def fetch_all(config: dict, since: datetime) -> list[Mention]:
+    terms = [t["query"] for t in config["search_terms"]]
+    mentions: list[Mention] = []
+    src = config["sources"]
+    if src.get("hackernews", {}).get("enabled"):
+        print("Fetching Hacker News…")
+        mentions += fetch_hackernews(terms, since)
+    if src.get("reddit", {}).get("enabled"):
+        print("Fetching Reddit…")
+        mentions += fetch_reddit(terms, since, src["reddit"])
+    if src.get("twitter", {}).get("enabled"):
+        print("Fetching X/Twitter…")
+        mentions += fetch_twitter(terms, since, src["twitter"])
+    if src.get("news", {}).get("enabled"):
+        print("Fetching news…")
+        mentions += fetch_news(terms, since, src["news"])
+    return mentions
+
+# ===== from news.py =====
+
+
+
+
+_STOP = set("a an the of to for and or in on at is are be with we our their this that "
+            "new how why what plan ai 2027 2040".split())
+
+
+def _norm_title(t: str) -> str:
+    t = re.sub(r"\s*[-–|]\s*[^-–|]+$", "", t)        # strip trailing " - Outlet"
+    t = re.sub(r"[^a-z0-9 ]", " ", t.lower())
+    toks = [w for w in t.split() if w not in _STOP and len(w) > 2]
+    return " ".join(toks)
+
+
+def _similar(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    ta, tb = set(a.split()), set(b.split())
+    jacc = len(ta & tb) / len(ta | tb) if (ta | tb) else 0
+    return max(jacc, SequenceMatcher(None, a, b).ratio())
+
+
+def _name_matches(name: str, outlet: str, domain: str) -> bool:
+    """Match a configured outlet name against the article's outlet/domain using
+    WORD BOUNDARIES, so 'TIME' matches 'Time' but not 'Hindustan Times', and a
+    compact form ('newyorktimes') matches the domain (nytimes.com -> contains
+    'nytimes'? no) — so we also try the spaced name inside the outlet text."""
+    n = name.lower().strip()
+    if re.search(r"\b" + re.escape(n) + r"\b", outlet.lower()):
+        return True
+    # domain check: the de-spaced name must EQUAL a whole domain label, so
+    # 'time' matches time.com but NOT hindustantimes.com.
+    host = re.sub(r"^https?://", "", (domain or "").lower()).split("/")[0]
+    labels = {lbl for lbl in host.split(".") if lbl not in ("www", "com", "org", "net", "co", "uk", "io")}
+    return re.sub(r"[^a-z0-9]", "", n) in labels
+
+
+def _tier_of(outlet: str, domain: str, tier1: list[str], tier2: list[str]) -> int:
+    if any(_name_matches(t, outlet, domain) for t in tier1):
+        return 1
+    if any(_name_matches(t, outlet, domain) for t in tier2):
+        return 2
+    return 3
+
+
+def _fetch_rss(term: str, limit: int = 50):
+    q = urllib.parse.quote(f'"{term}"')
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    req = urllib.request.Request(url, headers={"User-Agent": "plan-a-monitor/0.1"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        root = ET.fromstring(r.read())
+    items = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        pub = it.findtext("pubDate") or ""
+        src_el = it.find("source")
+        outlet = (src_el.text if src_el is not None else "").strip()
+        domain = (src_el.get("url") if src_el is not None else "") or ""
+        try:
+            dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=timezone.utc)
+        except Exception:
+            dt = datetime.now(timezone.utc)
+        items.append({"title": title, "link": link, "outlet": outlet,
+                      "domain": domain, "date": dt})
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_news(terms, since, cfg) -> list[Mention]:
+    tier1 = cfg.get("tier1_outlets", [])
+    tier2 = cfg.get("tier2_outlets", [])
+    pickup_threshold = int(cfg.get("pickup_threshold", 5))
+    min_tier = int(cfg.get("min_tier", 2))          # 1 = only top outlets, 2 = top+mid
+
+    # 1) gather raw articles
+    raw = []
+    for term in terms:
+        try:
+            raw += _fetch_rss(term)
+        except Exception as e:
+            print(f"  [News] error for '{term}': {e}")
+    # de-dupe identical links, keep within time window
+    seen_links, articles = set(), []
+    for a in raw:
+        if a["link"] in seen_links or a["date"] < since:
+            continue
+        seen_links.add(a["link"])
+        a["norm"] = _norm_title(a["title"])
+        a["tier"] = _tier_of(a["outlet"], a["domain"], tier1, tier2)
+        articles.append(a)
+
+    # 2) cluster near-duplicate stories
+    clusters = []
+    for a in articles:
+        placed = False
+        for c in clusters:
+            if _similar(a["norm"], c["norm"]) >= 0.6:
+                c["members"].append(a)
+                placed = True
+                break
+        if not placed:
+            clusters.append({"norm": a["norm"], "members": [a]})
+
+    # 3) apply the bar + emit one Mention per qualifying cluster
+    out = []
+    for c in clusters:
+        members = c["members"]
+        outlets = {m["outlet"] for m in members if m["outlet"]}
+        best = min(members, key=lambda m: m["tier"])        # lowest tier number = most authoritative
+        best_tier = best["tier"]
+        pickup = len(outlets)
+        qualifies = (best_tier <= min_tier) or (pickup >= pickup_threshold)
+        if not qualifies:
+            continue
+        others = sorted(outlets - {best["outlet"]})
+        out.append(Mention(
+            platform="news",
+            id=best["link"],
+            url=best["link"],
+            text=re.sub(r"\s*[-–|]\s*[^-–|]+$", "", best["title"]),
+            author=best["outlet"],
+            author_name=best["outlet"],
+            created_at=best["date"],
+            engagement=pickup * 10 + (100 if best_tier == 1 else 40 if best_tier == 2 else 0),
+            metrics={"outlet": best["outlet"], "tier": best_tier,
+                     "pickup_count": pickup, "also_covered": others[:10]},
+        ))
+    return out
+
+# ===== from relevance.py =====
+
+
+
+
+# --------------------------------------------------------------------------
+# Stage 1: rule-based prefilter
+# --------------------------------------------------------------------------
+def prefilter(mentions, config):
+    """Tag each mention with a confidence and drop obvious non-matches."""
+    high_terms = [t["query"].lower() for t in config["search_terms"] if t["precision"] == "high"]
+    low_terms = [t["query"].lower() for t in config["search_terms"] if t["precision"] == "low"]
+    context = [c.lower() for c in config.get("context_terms", [])]
+
+    kept = []
+    for m in mentions:
+        text = m.text.lower()
+        if any(t in text for t in high_terms):
+            m.confidence = "high"
+            kept.append(m)
+            continue
+        if any(t in text for t in low_terms):
+            if any(c in text for c in context):
+                m.confidence = "medium"
+            else:
+                m.confidence = "low"     # ambiguous — let the AI decide later
+            kept.append(m)
+            continue
+        # No search phrase in the visible text. Keep ONLY if it's a link-style
+        # post whose article body we can still fetch and vet (e.g. an HN
+        # submission that just links to an article); otherwise DROP it — this
+        # is the fuzzy-search noise we don't want.
+        if m.metrics.get("article_url"):
+            m.confidence = "low"
+            kept.append(m)
+    return kept
+
+
+# --------------------------------------------------------------------------
+# Stage 2a: keyword fallback (used only if the AI classifier is disabled)
+# --------------------------------------------------------------------------
+_POS = ["great", "excellent", "impressive", "love", "brilliant", "important",
+        "thoughtful", "excited", "endorse", "agree", "best", "must-read", "smart"]
+_NEG = ["wrong", "bad", "terrible", "nonsense", "doomer", "fearmonger", "grift",
+        "cult", "naive", "unrealistic", "debunked", "captured", "shill", "stupid",
+        "hype", "overblown", "aged poorly", "didn't happen"]
+
+
+def keyword_sentiment(m):
+    t = m.text.lower()
+    pos = sum(w in t for w in _POS)
+    neg = sum(w in t for w in _NEG)
+    if neg > pos:
+        return "negative"
+    if pos > neg:
+        return "positive"
+    return "neutral"
+
+
+_THEME_BY_SENTIMENT = {"negative": "negative reactions",
+                       "positive": "positive reactions",
+                       "neutral": "neutral mentions"}
+
+
+def keyword_fallback(mentions):
+    for m in mentions:
+        # Without the AI we can't truly verify relevance. We keep high- and
+        # medium-confidence items (prefer false positives over misses), but
+        # we DROP low-confidence ones: an ambiguous term like "Plan A" or
+        # "AI 2027" with no context word nearby is exactly the Google-Alerts
+        # noise we're trying to avoid, and there's no AI here to vet it.
+        m.relevant = m.confidence in ("high", "medium")
+        m.sentiment = keyword_sentiment(m)
+        m.theme = _THEME_BY_SENTIMENT.get(m.sentiment, "neutral mentions")
+        m.summary = (m.text[:140] + "…") if len(m.text) > 140 else m.text
+    return mentions
+
+
+# --------------------------------------------------------------------------
+# Stage 2b: AI classifier (Anthropic or OpenAI), batched
+# --------------------------------------------------------------------------
+_SYSTEM = (
+    "You are a media-monitoring analyst for the AI Futures Project (AIFP), a "
+    "nonprofit that published the viral 'AI 2027' scenario and is now releasing "
+    "a follow-up titled 'AI 2040: Plan A' (a.k.a. 'Plan A'). Authors include "
+    "Daniel Kokotajlo, Eli Lifland, Thomas Larsen, Scott Alexander. For each "
+    "social-media post, decide whether it is genuinely about AIFP or its work "
+    "(AI 2027 / AI 2040 / Plan A / its authors / its forecasts) versus a "
+    "coincidental match (e.g. someone using the phrase 'plan A' normally, or "
+    "'AI 2027' meaning a generic year). Then label sentiment and theme. "
+    "Be inclusive about relevance when uncertain (false positives are better "
+    "than misses), but mark clearly-unrelated posts as about_aifp=false."
+)
+
+_INSTR = (
+    'Return ONLY a JSON array. For each post return an object: '
+    '{"i": <index>, "about_aifp": true|false, '
+    '"sentiment": "positive"|"neutral"|"negative"|"mixed", '
+    '"stance": "supportive"|"substantive_critique"|"dismissive"|"question"|"news_share"|"off_topic", '
+    '"theme": "<3-6 word label>", "summary": "<one sentence, neutral>"}'
+)
+
+
+def _anthropic_call(api_key, model, prompt):
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 2000,
+        "system": _SYSTEM,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.load(r)
+    return data["content"][0]["text"]
+
+
+def _openai_call(api_key, model, prompt):
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": _SYSTEM},
+                     {"role": "user", "content": prompt}],
+        "temperature": 0,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.load(r)
+    return data["choices"][0]["message"]["content"]
+
+
+def _extract_json(text):
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    return json.loads(m.group(0)) if m else []
+
+
+def fetch_article_text(url, limit=2000):
+    """Best-effort plain-text grab of an article so the AI judges on content,
+    not just a headline. Crude HTML strip; returns '' on any failure."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 plan-a-monitor"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            html = r.read(400_000).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    html = re.sub(r"(?is)<(script|style|nav|header|footer).*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()[:limit]
+
+
+def ai_classify(mentions, llm_cfg):
+    provider = llm_cfg.get("provider", "anthropic")
+    model = llm_cfg["model"]
+    api_key = llm_cfg["api_key"]
+    batch = int(llm_cfg.get("batch_size", 15))
+    get_article = llm_cfg.get("fetch_article_text", True)
+
+    # For news + HN link-submissions, pull the article body so relevance and
+    # sentiment are based on the real content (fixes headline-only ambiguity).
+    if get_article:
+        for m in mentions:
+            url = m.metrics.get("article_url") if m.platform == "hackernews" else (
+                m.url if m.platform == "news" else None)
+            if url:
+                body = fetch_article_text(url)
+                if body:
+                    m.metrics["article_excerpt"] = body[:1200]
+
+    for start in range(0, len(mentions), batch):
+        chunk = mentions[start:start + batch]
+        posts = [{"i": i, "platform": m.platform, "author": m.author or m.author_name,
+                  "text": m.text[:600],
+                  "article_excerpt": m.metrics.get("article_excerpt", "")[:900]}
+                 for i, m in enumerate(chunk)]
+        prompt = (f"{_INSTR}\n\nPosts:\n{json.dumps(posts, ensure_ascii=False)}")
+        try:
+            raw = (_anthropic_call if provider == "anthropic" else _openai_call)(api_key, model, prompt)
+            results = {r["i"]: r for r in _extract_json(raw)}
+        except Exception as e:
+            print(f"  [AI] batch failed ({e}); falling back to keywords for this batch.")
+            keyword_fallback(chunk)
+            continue
+        for i, m in enumerate(chunk):
+            r = results.get(i)
+            if not r:
+                m.relevant, m.sentiment = True, keyword_sentiment(m)
+                m.summary = m.text[:140]
+                continue
+            m.relevant = bool(r.get("about_aifp", True))
+            m.sentiment = r.get("sentiment", "neutral")
+            m.stance = r.get("stance", "")
+            m.theme = r.get("theme", "")
+            m.summary = r.get("summary", "")
+    return mentions
+
+
+def classify(mentions, config):
+    """Run prefilter then either AI or keyword labeling."""
+    kept = prefilter(mentions, config)
+    if config.get("llm", {}).get("enabled") and config["llm"].get("api_key", "") not in ("", "FILL IN"):
+        ai_classify(kept, config["llm"])
+    else:
+        keyword_fallback(kept)
+    # keep only the ones judged relevant (AI) or rule-kept (fallback)
+    return [m for m in kept if m.relevant]
+
+# ===== from analyze.py =====
+
+
+
+
+# --------------------------------------------------------------------------
+# Watchlist matching
+# --------------------------------------------------------------------------
+def _watch_hit(m, watchlist):
+    a = (m.author or "").lower().lstrip("@")
+    name = (m.author_name or "").lower()
+    for w in watchlist:
+        handles = [h.lower().lstrip("@") for h in w.get("handles", [])]
+        if a and a in handles:
+            return w
+        if w["name"].lower() in name or (name and name in w["name"].lower()):
+            return w
+    return None
+
+
+# --------------------------------------------------------------------------
+# Per-post priority + tier
+# --------------------------------------------------------------------------
+def score_mentions(mentions, config):
+    th = config["thresholds"]
+    watchlist = config.get("watchlist", [])
+    for m in mentions:
+        score = float(m.engagement)
+        tier = "low"
+
+        # platform-specific "notable on its own" bars
+        p = m.metrics
+        if m.platform == "twitter":
+            if p.get("likes", 0) >= th["twitter"]["likes"] or p.get("reposts", 0) >= th["twitter"]["reposts"] \
+               or (m.author_followers or 0) >= th["twitter"]["author_followers"]:
+                tier = "high"
+        elif m.platform == "reddit":
+            if p.get("score", 0) >= th["reddit"]["score"] or p.get("num_comments", 0) >= th["reddit"]["num_comments"]:
+                tier = "high"
+        elif m.platform == "hackernews":
+            if p.get("points", 0) >= th["hackernews"]["points"] or p.get("num_comments", 0) >= th["hackernews"]["num_comments"]:
+                tier = "high"
+        elif m.platform == "news":
+            # already passed the big-outlet / syndication bar in news.py
+            tier = "critical" if p.get("tier") == 1 else "high"
+
+        # substantive critique always worth a look even if small
+        if m.stance == "substantive_critique" and tier == "low":
+            tier = "high"
+
+        # watchlist authors override everything
+        w = _watch_hit(m, watchlist)
+        if w:
+            tier = "critical" if w.get("weight") == "critical" else "high"
+            score += 10000 if w.get("weight") == "critical" else 5000
+            m.summary = f"[{w['name']}] " + (m.summary or m.text[:120])
+
+        # negative posts from anyone get a small bump (we care about these more)
+        if m.sentiment == "negative":
+            score += 50
+
+        m.priority = score
+        m.tier = tier
+    return mentions
+
+
+# --------------------------------------------------------------------------
+# Volume + theme aggregation (counts EVERY relevant mention, big or small)
+# --------------------------------------------------------------------------
+def aggregate(mentions, config):
+    by_platform = Counter(m.platform for m in mentions)
+    by_sentiment = Counter(m.sentiment for m in mentions)
+
+    # theme clusters: use AI theme if present, else fall back to stance
+    themes = defaultdict(list)
+    for m in mentions:
+        key = (m.theme or m.stance or "uncategorized").strip().lower()
+        themes[key].append(m)
+
+    theme_rows = []
+    for key, items in themes.items():
+        sents = Counter(i.sentiment for i in items)
+        n = len(items)
+        neg = sents.get("negative", 0)
+        # representative = highest-engagement example in the cluster
+        rep = max(items, key=lambda x: x.engagement)
+        theme_rows.append({
+            "theme": key,
+            "count": n,
+            "neg_pct": round(100 * neg / n) if n else 0,
+            "sentiment_breakdown": dict(sents),
+            "example_url": rep.url,
+            "example_text": (rep.text[:160] + "…") if len(rep.text) > 160 else rep.text,
+            "mostly_small": rep.engagement < 10,   # flag low-engagement-but-loud clusters
+        })
+    theme_rows.sort(key=lambda r: r["count"], reverse=True)
+
+    # narrative watch
+    narrative_hits = []
+    for nar in config.get("narratives", []):
+        kws = [k.lower() for k in nar["keywords"]]
+        hits = [m for m in mentions if any(k in m.text.lower() for k in kws)]
+        if hits:
+            narrative_hits.append({"label": nar["label"], "count": len(hits),
+                                   "alert": len(hits) >= nar.get("alert_count", 999),
+                                   "example_url": max(hits, key=lambda x: x.engagement).url})
+
+    return {
+        "total": len(mentions),
+        "by_platform": dict(by_platform),
+        "by_sentiment": dict(by_sentiment),
+        "themes": theme_rows,
+        "narratives": narrative_hits,
+    }
+
+
+def detect_spike(current_total, baseline_avg, factor):
+    if baseline_avg <= 0:
+        return False, 0.0
+    ratio = current_total / baseline_avg
+    return ratio >= factor, round(ratio, 1)
+
+
+def compute_triggers(new_mentions, agg, spike, spike_ratio, config):
+    """Decide whether this run is 'noteworthy'. In alert mode we stay silent
+    unless at least one trigger fires. Returns (triggered, reasons, items).
+
+    Triggers (the two things you named, plus spike):
+      1. A single post/article getting real attention (tier critical/high).
+      2. A pattern of many small posts (a theme cluster crossing a size bar).
+      3. A volume spike vs. the normal rate.
+      4. A configured 'narrative watch' storyline crossing its threshold.
+    """
+    cluster_alert = int(config.get("cluster_alert_count", 6))
+    reasons = []
+
+    individual = [m for m in new_mentions if m.tier in ("critical", "high")]
+    if individual:
+        reasons.append(f"{len(individual)} high-attention post(s)/article(s)")
+
+    pattern_themes = [t for t in agg["themes"]
+                      if t["count"] >= cluster_alert and t["mostly_small"]]
+    for t in pattern_themes:
+        reasons.append(f"pattern: '{t['theme']}' ({t['count']} small posts, {t['neg_pct']}% neg)")
+
+    if spike:
+        reasons.append(f"volume spike {spike_ratio}x normal")
+
+    # Negativity surge — "a lot of people are suddenly saying bad things."
+    # This fires on sentiment, independently of raw volume, and pulls the
+    # negative posts into view even if individually small.
+    neg_mentions = [m for m in new_mentions if m.sentiment == "negative"]
+    if len(neg_mentions) >= int(config.get("neg_surge_count", 5)):
+        reasons.append(f"⚠️ negativity surge: {len(neg_mentions)} negative mentions")
+        for m in neg_mentions:
+            if m not in individual:
+                individual.append(m)
+
+    fired_narratives = [n for n in agg["narratives"] if n["alert"]]
+    for n in fired_narratives:
+        reasons.append(f"narrative '{n['label']}' ({n['count']})")
+
+    triggered = bool(reasons)
+    return triggered, reasons, individual, pattern_themes, fired_narratives
+
+# ===== from store.py =====
+
+
+
+_SEEN = "seen_ids.json"
+_HIST = "run_history.json"
+_ALERTED = "alerted.json"
+_TS = "timeseries.json"
+
+
+def _load(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
+
+
+def filter_new(mentions, state_dir="."):
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, _SEEN)
+    seen = set(_load(path, []))
+    fresh = [m for m in mentions if f"{m.platform}:{m.id}" not in seen]
+    for m in mentions:
+        seen.add(f"{m.platform}:{m.id}")
+    # keep the file from growing forever
+    seen = set(list(seen)[-50000:])
+    with open(path, "w") as f:
+        json.dump(sorted(seen), f)
+    return fresh
+
+
+def baseline_and_record(current_total, state_dir="."):
+    """Return the rolling average of recent runs, then record this run."""
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, _HIST)
+    hist = _load(path, [])
+    prev = [h["total"] for h in hist[-12:]]          # last ~12 runs
+    avg = (sum(prev) / len(prev)) if prev else 0.0
+    hist.append({"ts": datetime.now(timezone.utc).isoformat(), "total": current_total})
+    hist = hist[-200:]
+    with open(path, "w") as f:
+        json.dump(hist, f, indent=2)
+    return avg
+
+
+def record_timeseries(agg, new_mentions, state_dir="."):
+    """Append one data point per run for the live dashboard: counts by
+    sentiment + platform, top themes, and a few notable items."""
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, _TS)
+    ts = _load(path, [])
+    sent = agg["by_sentiment"]
+    notable = sorted([m for m in new_mentions if m.tier in ("critical", "high")],
+                     key=lambda m: m.priority, reverse=True)[:8]
+    ts.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "total": agg["total"],
+        "positive": sent.get("positive", 0),
+        "negative": sent.get("negative", 0),
+        "neutral": sent.get("neutral", 0) + sent.get("mixed", 0),
+        "by_platform": agg["by_platform"],
+        "themes": [{"theme": t["theme"], "count": t["count"], "neg_pct": t["neg_pct"]}
+                   for t in agg["themes"][:5]],
+        "notable": [{"platform": m.platform, "author": m.author or m.author_name,
+                     "sentiment": m.sentiment, "url": m.url,
+                     "summary": (m.summary or m.text[:140])} for m in notable],
+    })
+    ts = ts[-5000:]
+    with open(path, "w") as f:
+        json.dump(ts, f)
+    return ts
+
+
+def filter_unalerted(individual, state_dir=".", escalate_factor=4.0):
+    """Don't re-alert the same individual post every cycle. Re-alert only if
+    its engagement has grown a lot since we last flagged it (escalation)."""
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, _ALERTED)
+    alerted = _load(path, {})
+    fresh = []
+    for m in individual:
+        key = f"{m.platform}:{m.id}"
+        prev = alerted.get(key)
+        if prev is None or m.engagement >= max(prev * escalate_factor, prev + 50):
+            fresh.append(m)
+            alerted[key] = m.engagement
+    # trim
+    if len(alerted) > 20000:
+        alerted = dict(list(alerted.items())[-20000:])
+    with open(path, "w") as f:
+        json.dump(alerted, f)
+    return fresh
+
+# ===== from notify.py =====
+
+
+
+_EMOJI = {"positive": "🟢", "negative": "🔴", "neutral": "⚪", "mixed": "🟡", "unknown": "⚪"}
+_TIER = {"critical": "🔴", "high": "🟡", "low": "⚪"}
+
+
+def _datestr(m):
+    return m.created_at.strftime("%b %-d") if m.created_at else ""
+
+
+def _engagement_str(m):
+    p = m.metrics
+    if m.platform == "twitter":
+        f = f", {m.author_followers:,} followers" if m.author_followers else ""
+        return f"{p.get('likes',0)} likes / {p.get('reposts',0)} reposts{f}"
+    if m.platform == "reddit":
+        return f"{p.get('score',0)} upvotes / {p.get('num_comments',0)} comments (r/{p.get('subreddit','')})"
+    if m.platform == "hackernews":
+        return f"{p.get('points',0)} points / {p.get('num_comments',0)} comments"
+    if m.platform == "news":
+        tier = {1: "tier-1", 2: "tier-2"}.get(p.get("tier"), "other")
+        extra = f", +{p.get('pickup_count',1)-1} more outlets" if p.get("pickup_count", 1) > 1 else ""
+        return f"{p.get('outlet','')} ({tier}){extra}"
+    return f"{m.engagement} engagement"
+
+
+def _item_line(m):
+    """One consistent block per item, with date and (for HN link posts) the
+    underlying article so a bare link-submission reads as an article, not just
+    a discussion thread."""
+    who = m.author or m.author_name or "unknown"
+    date = _datestr(m)
+    head = (f"{_TIER.get(m.tier,'⚪')} {_EMOJI.get(m.sentiment,'⚪')} *{m.platform}* · {who} · "
+            f"{_engagement_str(m)}" + (f" · {date}" if date else ""))
+    body = f"   {m.summary or m.text[:150]}"
+    art = m.metrics.get("article_url")
+    dom = m.metrics.get("domain")
+    if m.platform == "hackernews" and art and dom:
+        links = f"   📰 <{art}|{dom} article> · <{m.url}|HN discussion>"
+    else:
+        links = f"   <{m.url}|view>"
+    return head + "\n" + body + "\n" + links
+
+
+def build_digest(new_mentions, agg, spike, spike_ratio, baseline, title):
+    lines = []
+    sent = agg["by_sentiment"]
+    plat = agg["by_platform"]
+    lines.append(f"*{title}*")
+    plat_str = ", ".join(f"{k}: {v}" for k, v in plat.items()) or "none"
+    lines.append(f"*{agg['total']} new mentions*  ({plat_str})")
+    lines.append(f"Sentiment — 🟢 {sent.get('positive',0)} · ⚪ {sent.get('neutral',0)} "
+                 f"· 🔴 {sent.get('negative',0)} · 🟡 {sent.get('mixed',0)}")
+
+    alerts = []
+    if spike:
+        alerts.append(f"📈 *Volume spike*: {agg['total']} mentions this window "
+                      f"≈ {spike_ratio}× the recent average ({baseline:.0f}).")
+    for nar in agg["narratives"]:
+        if nar["alert"]:
+            alerts.append(f"🚨 *Narrative '{nar['label']}'* gaining traction: "
+                          f"{nar['count']} mentions. <{nar['example_url']}|example>")
+    if alerts:
+        lines.append("\n*⚠️ ALERTS*")
+        lines += alerts
+
+    notable = sorted([m for m in new_mentions if m.tier in ("critical", "high")],
+                     key=lambda m: m.priority, reverse=True)[:15]
+    if notable:
+        lines.append("\n*🔎 Posts that need your eyes*")
+        for m in notable:
+            lines.append(_item_line(m))
+
+    # Volume section: only show clusters that actually represent MORE THAN ONE
+    # post — never present a single item as an aggregated "pattern".
+    clusters = [t for t in agg["themes"] if t["count"] >= 2]
+    if clusters:
+        lines.append("\n*📊 What people are saying (by volume)*")
+        for t in clusters[:8]:
+            tag = " · 💬 mostly small accounts" if t["mostly_small"] and t["count"] >= 5 else ""
+            lines.append(f"• *{t['theme']}* — {t['count']} mentions, {t['neg_pct']}% negative{tag}\n"
+                         f"   e.g. <{t['example_url']}|“{t['example_text'][:90]}”>")
+    return "\n".join(lines)
+
+
+def build_alert(reasons, individual, pattern_themes, narratives, title):
+    lines = [f"*🔔 {title}*", "_" + "; ".join(reasons) + "_"]
+    if individual:
+        lines.append("\n*Posts/articles getting attention*")
+        for m in sorted(individual, key=lambda x: x.priority, reverse=True)[:12]:
+            lines.append(_item_line(m))
+    # Only describe "patterns" when there's an actual cluster of several posts.
+    real_patterns = [t for t in pattern_themes if t["count"] >= 2]
+    if real_patterns:
+        lines.append("\n*Patterns building (lots of small posts)*")
+        for t in real_patterns:
+            lines.append(f"• *{t['theme']}* — {t['count']} posts, {t['neg_pct']}% negative "
+                         f"<{t['example_url']}|example>")
+    if narratives:
+        lines.append("\n*Narrative watch*")
+        for n in narratives:
+            lines.append(f"🚨 *{n['label']}* — {n['count']} mentions <{n['example_url']}|example>")
+    return "\n".join(lines)
+
+
+def post_to_slack(webhook_url, text):
+    for chunk in _chunk(text, 3500):
+        body = json.dumps({"text": chunk}).encode()
+        req = urllib.request.Request(webhook_url, data=body,
+                                     headers={"content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=20).read()
+
+
+def _chunk(text, size):
+    lines, cur, n = text.split("\n"), [], 0
+    for ln in lines:
+        if n + len(ln) > size and cur:
+            yield "\n".join(cur)
+            cur, n = [], 0
+        cur.append(ln)
+        n += len(ln) + 1
+    if cur:
+        yield "\n".join(cur)
+
+# ===== main =====
+def _env_overlay(c):
+    s=c.setdefault("slack",{})
+    if os.getenv("SLACK_WEBHOOK_URL"): s["webhook_url"]=os.getenv("SLACK_WEBHOOK_URL")
+    l=c.setdefault("llm",{})
+    if os.getenv("ANTHROPIC_API_KEY"): l["api_key"]=os.getenv("ANTHROPIC_API_KEY")
+    src=c.setdefault("sources",{})
+    tw=src.setdefault("twitter",{})
+    if os.getenv("X_BEARER_TOKEN"): tw["bearer_token"]=os.getenv("X_BEARER_TOKEN"); tw["enabled"]=True
+    rd=src.setdefault("reddit",{})
+    if os.getenv("REDDIT_CLIENT_ID"):
+        rd["client_id"]=os.getenv("REDDIT_CLIENT_ID"); rd["client_secret"]=os.getenv("REDDIT_CLIENT_SECRET",""); rd["enabled"]=True
+        rd.setdefault("user_agent","plan-a-monitor")
+    return c
+def load_config(path):
+    import yaml
+    with open(path) as f:
+        return _env_overlay(yaml.safe_load(f))
+def run(config, dry_run=False, mentions=None, state_dir="."):
+    since = datetime.now(timezone.utc) - timedelta(hours=config.get("lookback_hours", 6))
+    if mentions is None: mentions = fetch_all(config, since)
+    print(f"Fetched {len(mentions)} raw mentions.")
+    mentions = classify(mentions, config); print(f"{len(mentions)} judged relevant.")
+    new = filter_new(mentions, state_dir); print(f"{len(new)} new since last run.")
+    score_mentions(new, config); agg = aggregate(new, config)
+    baseline = baseline_and_record(agg["total"], state_dir)
+    spike, ratio = detect_spike(agg["total"], baseline, config.get("spike_factor", 3.0))
+    record_timeseries(agg, new, state_dir)
+    title = config.get("slack", {}).get("digest_title", "Plan A monitor")
+    mode = config.get("mode", "alerts")
+    if mode == "digest":
+        message = build_digest(new, agg, spike, ratio, baseline, title)
+    else:
+        triggered, reasons, individual, patterns, narr = compute_triggers(new, agg, spike, ratio, config)
+        individual = filter_unalerted(individual, state_dir, config.get("escalate_factor", 4.0))
+        if not (individual or patterns or narr):
+            print("Nothing noteworthy this run — staying quiet."); return None
+        message = build_alert(reasons, individual, patterns, narr, title)
+    wh = config.get("slack", {}).get("webhook_url", "")
+    if dry_run or not wh or wh == "FILL IN":
+        print("\n"+"="*70+f"\n{mode.upper()} (dry run)\n"+"="*70+"\n"+message)
+    else:
+        post_to_slack(wh, message); print(f"Posted {mode} to Slack.")
+    return message
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--dry-run", action="store_true"); args = ap.parse_args()
+    run(load_config(args.config), dry_run=args.dry_run)
+if __name__ == "__main__":
+    sys.exit(main())

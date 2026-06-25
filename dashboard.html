@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan A — public response dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#0f1216;--card:#171b21;--ink:#e8eaed;--mut:#9aa3ad;--line:#262c34;
+        --pos:#34c759;--neg:#ff453a;--neu:#8e8e93;--accent:#5e9bff;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:20px 24px;border-bottom:1px solid var(--line);display:flex;
+    align-items:baseline;gap:14px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0} .sub{color:var(--mut);font-size:13px}
+  .wrap{padding:20px 24px;max-width:1100px;margin:0 auto}
+  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card .n{font-size:30px;font-weight:650} .card .l{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+  .panel h2{font-size:14px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+  .item{padding:10px 0;border-bottom:1px solid var(--line)} .item:last-child{border:0}
+  .item a{color:var(--accent);text-decoration:none} .item a:hover{text-decoration:underline}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}
+  .meta{color:var(--mut);font-size:12px}
+  .theme{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)}
+  .empty{color:var(--mut);padding:8px 0}
+  .pill{font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:999px;padding:2px 8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Plan A — public response</h1>
+  <span class="sub" id="status">loading…</span>
+  <span class="sub pill" id="updated"></span>
+</header>
+<div class="wrap">
+  <div class="cards">
+    <div class="card"><div class="n" id="c-total">–</div><div class="l">Mentions (24h)</div></div>
+    <div class="card"><div class="n" style="color:var(--neg)" id="c-neg">–</div><div class="l">Negative (24h)</div></div>
+    <div class="card"><div class="n" style="color:var(--pos)" id="c-pos">–</div><div class="l">Positive (24h)</div></div>
+    <div class="card"><div class="n" id="c-negpct">–</div><div class="l">% Negative (24h)</div></div>
+  </div>
+  <div class="panel"><h2>Mention volume &amp; sentiment over time</h2><canvas id="chart" height="110"></canvas></div>
+  <div class="panel"><h2>What people are saying — themes (recent)</h2><div id="themes"></div></div>
+  <div class="panel"><h2>Recent notable posts &amp; articles</h2><div id="notable"></div></div>
+</div>
+<script>
+const DOT={positive:'var(--pos)',negative:'var(--neg)',neutral:'var(--neu)',mixed:'var(--neu)',unknown:'var(--neu)'};
+let chart;
+async function load(){
+  let data=[];
+  try{ const r=await fetch('timeseries.json?_='+Date.now()); data=await r.json(); }
+  catch(e){ document.getElementById('status').textContent='no data yet (timeseries.json not found)'; return; }
+  if(!Array.isArray(data)||!data.length){ document.getElementById('status').textContent='waiting for first data point…'; return; }
+
+  const now=Date.now(), DAY=864e5;
+  const last24=data.filter(d=>now-new Date(d.ts).getTime()<DAY);
+  const sum=(arr,k)=>arr.reduce((a,d)=>a+(d[k]||0),0);
+  const tot=sum(last24,'total'), neg=sum(last24,'negative'), pos=sum(last24,'positive');
+  document.getElementById('c-total').textContent=tot;
+  document.getElementById('c-neg').textContent=neg;
+  document.getElementById('c-pos').textContent=pos;
+  document.getElementById('c-negpct').textContent=(tot? Math.round(100*neg/tot):0)+'%';
+  document.getElementById('status').textContent=data.length+' data points';
+  document.getElementById('updated').textContent='updated '+new Date(data[data.length-1].ts).toLocaleString();
+
+  // chart: stacked sentiment bars + total line
+  const labels=data.map(d=>new Date(d.ts).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit'}));
+  const ds=(k,c)=>({label:k,data:data.map(d=>d[k]||0),backgroundColor:c,stack:'s',borderWidth:0});
+  const cfg={type:'bar',data:{labels,datasets:[
+      ds('negative','#ff453a'),ds('neutral','#8e8e93'),ds('positive','#34c759')]},
+    options:{responsive:true,plugins:{legend:{labels:{color:'#9aa3ad'}}},
+      scales:{x:{stacked:true,ticks:{color:'#9aa3ad',maxTicksLimit:12},grid:{display:false}},
+              y:{stacked:true,ticks:{color:'#9aa3ad'},grid:{color:'#262c34'}}}}};
+  if(chart)chart.destroy();
+  chart=new Chart(document.getElementById('chart'),cfg);
+
+  // themes (from the most recent points)
+  const tmap={};
+  data.slice(-8).forEach(d=>(d.themes||[]).forEach(t=>{tmap[t.theme]=(tmap[t.theme]||0)+t.count;}));
+  const themes=Object.entries(tmap).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  document.getElementById('themes').innerHTML = themes.length
+    ? themes.map(([t,c])=>`<div class="theme"><span>${t}</span><span class="meta">${c}</span></div>`).join('')
+    : '<div class="empty">No themes yet.</div>';
+
+  // notable (dedupe by url, newest first)
+  const seen=new Set(), items=[];
+  for(const d of [...data].reverse()) for(const m of (d.notable||[])){
+    if(seen.has(m.url))continue; seen.add(m.url); items.push(m); if(items.length>=25)break;
+  }
+  document.getElementById('notable').innerHTML = items.length
+    ? items.map(m=>`<div class="item"><span class="dot" style="background:${DOT[m.sentiment]||'var(--neu)'}"></span>
+        <a href="${m.url}" target="_blank">${(m.summary||'').replace(/</g,'&lt;')}</a>
+        <div class="meta">${m.platform} · ${m.author||''} · ${m.sentiment}</div></div>`).join('')
+    : '<div class="empty">No notable posts yet.</div>';
+}
+load(); setInterval(load, 120000); // refresh every 2 min
+</script>
+</body>
+</html>

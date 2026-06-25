@@ -1,0 +1,247 @@
+search_terms:
+- query: AI 2040
+  precision: high
+- query: AI Futures Project
+  precision: high
+- query: Daniel Kokotajlo
+  precision: high
+- query: ai-2040.com
+  precision: high
+- query: Plan A
+  precision: low
+- query: AI 2027
+  precision: low
+context_terms:
+- AI Futures
+- Kokotajlo
+- Lifland
+- AI 2027
+- AI 2040
+- ai-2027.com
+- ai-2040.com
+- superintelligence
+- intelligence explosion
+- slowdown
+- takeoff
+- scenario
+watchlist:
+- name: David Sacks
+  handles:
+  - '@davidsacks'
+  weight: critical
+- name: Sriram Krishnan
+  handles:
+  - '@sriramk'
+  weight: critical
+- name: JD Vance
+  handles:
+  - '@jdvance'
+  weight: critical
+- name: Dean Ball
+  handles:
+  - '@deanwball'
+  weight: critical
+- name: Michael Kratsios
+  handles: []
+  weight: critical
+- name: Matt Yglesias
+  handles:
+  - '@mattyglesias'
+  weight: high
+- name: Ezra Klein
+  handles:
+  - '@ezraklein'
+  weight: high
+- name: Ross Douthat
+  handles:
+  - '@DouthatNYT'
+  weight: high
+- name: Dwarkesh Patel
+  handles:
+  - '@dwarkesh_sp'
+  weight: high
+- name: Kevin Roose
+  handles:
+  - '@kevinroose'
+  weight: high
+- name: Zvi Mowshowitz
+  handles:
+  - '@TheZvi'
+  weight: high
+- name: Jack Clark
+  handles:
+  - '@jackclarkSF'
+  weight: high
+- name: Nate Silver
+  handles:
+  - '@NateSilver538'
+  weight: high
+- name: Helen Toner
+  handles:
+  - '@hlntnr'
+  weight: high
+- name: Tyler Cowen
+  handles:
+  - '@tylercowen'
+  weight: high
+- name: Shakeel Hashim
+  handles:
+  - '@shakeelhashim'
+  weight: high
+narratives:
+- label: timelines-wrong
+  keywords:
+  - predictions wrong
+  - didn't happen
+  - didn't come true
+  - already wrong
+  - hasn't happened
+  - debunked
+  - aged poorly
+  - doomer
+  - fearmonger
+  - grift
+  - cult
+  - wrong again
+  - 2027 didn't
+  alert_count: 8
+- label: too-close-to-labs
+  keywords:
+  - captured
+  - shill
+  - lab propaganda
+  - regulatory capture
+  - industry
+  alert_count: 6
+- label: unrealistic-plan
+  keywords:
+  - unrealistic
+  - naive
+  - never happen
+  - fantasy
+  - utopian
+  - won't work
+  alert_count: 8
+- label: unscientific
+  keywords:
+  - unscientific
+  - too many assumptions
+  - not rigorous
+  - pseudoscience
+  - straight line
+  - no evidence
+  - made up
+  - just a story
+  - sci-fi
+  - science fiction
+  alert_count: 8
+- label: ignores-china
+  keywords:
+  - not taking china
+  - ignores china
+  - naive about china
+  - china won't
+  alert_count: 6
+- label: sensational-name
+  keywords:
+  - sensational
+  - clickbait
+  - fearmongering name
+  - overstated
+  - false urgency
+  alert_count: 6
+- label: doomer
+  keywords:
+  - doomer
+  - doomerism
+  - alarmist
+  - fear porn
+  - panic
+  alert_count: 8
+- label: overexposed
+  keywords:
+  - too many podcasts
+  - everywhere
+  - in my face
+  - shut up about
+  - overexposed
+  alert_count: 6
+thresholds:
+  twitter:
+    likes: 25
+    reposts: 8
+    author_followers: 20000
+  reddit:
+    score: 15
+    num_comments: 10
+  hackernews:
+    points: 20
+    num_comments: 15
+spike_factor: 3.0
+cluster_alert_count: 6
+neg_surge_count: 5
+escalate_factor: 4.0
+sources:
+  hackernews:
+    enabled: true
+  reddit:
+    enabled: false
+    client_id: FILL IN
+    client_secret: FILL IN
+    user_agent: plan-a-monitor by u/yourusername
+  twitter:
+    enabled: false
+    bearer_token: FILL IN
+    max_results: 100
+  news:
+    enabled: true
+    min_tier: 2
+    pickup_threshold: 5
+    tier1_outlets:
+    - New York Times
+    - Washington Post
+    - Wall Street Journal
+    - Bloomberg
+    - Financial Times
+    - The Economist
+    - Reuters
+    - Associated Press
+    - The Atlantic
+    - The New Yorker
+    - Politico
+    - Axios
+    - NPR
+    - TIME
+    - The Guardian
+    - BBC
+    - CNN
+    - CNBC
+    - Vox
+    - WIRED
+    - MIT Technology Review
+    - The Verge
+    - Forbes
+    - The Information
+    tier2_outlets:
+    - TechCrunch
+    - Ars Technica
+    - VentureBeat
+    - Semafor
+    - The Hill
+    - Business Insider
+    - Fortune
+    - The Times
+    - Fox News
+    - Slate
+    - The Verge
+llm:
+  enabled: true
+  provider: anthropic
+  api_key: ''
+  model: claude-sonnet-4-6
+  batch_size: 15
+mode: alerts
+slack:
+  webhook_url: ''
+  digest_title: "Plan A \u2014 public response monitor"
+lookback_hours: 1
