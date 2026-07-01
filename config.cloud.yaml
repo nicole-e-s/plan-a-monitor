@@ -42,7 +42,8 @@ watchlist:
   - '@deanwball'
   weight: critical
 - name: Michael Kratsios
-  handles: []
+  handles:
+  - '@mkratsios47'
   weight: critical
 - name: Matt Yglesias
   handles:
@@ -87,6 +88,10 @@ watchlist:
 - name: Shakeel Hashim
   handles:
   - '@shakeelhashim'
+  weight: high
+- name: Leopold Aschenbrenner
+  handles:
+  - '@leopoldasch'
   weight: high
 narratives:
 - label: timelines-wrong
@@ -238,10 +243,18 @@ llm:
   enabled: true
   provider: anthropic
   api_key: ''
-  model: claude-sonnet-4-6
+  # Cheap/fast model for the bulk relevance + sentiment pass:
+  model: claude-haiku-4-5-20251001
+  # Higher-fidelity model used ONLY to re-judge high-stakes items (negative /
+  # mixed sentiment or substantive critiques) — the posts that drive CRITICAL /
+  # WARNING alerts. Leave blank ('') to turn the second pass off.
+  escalate_model: claude-sonnet-5
   batch_size: 15
 mode: alerts
 slack:
   webhook_url: ''
   digest_title: "Plan A \u2014 public response monitor"
+  # Slack member ID pinged when the monitor errors out or silently degrades
+  # (e.g. the AI model fails and it falls back to keyword-only sentiment):
+  error_notify: U0BED0HLDLL
 lookback_hours: 1

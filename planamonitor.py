@@ -9,6 +9,19 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Optional
 
+# --------------------------------------------------------------------------
+# Run-level health tracking: collect problems (source errors, AI fallbacks,
+# a missing API key) so the operator gets pinged instead of the tool
+# degrading silently.
+# --------------------------------------------------------------------------
+_ERRORS: list[str] = []
+
+
+def _note_error(msg: str) -> None:
+    print("  ⚠ " + msg)
+    _ERRORS.append(msg)
+
+
 # ===== from sources.py =====
 
 
@@ -64,7 +77,7 @@ def fetch_hackernews(terms: list[str], since: datetime, limit: int = 100) -> lis
         try:
             data = _get_json(url)
         except Exception as e:
-            print(f"  [HN] error for '{term}': {e}")
+            _note_error(f"[HN] fetch error for '{term}': {e}")
             continue
         for h in data.get("hits", []):
             is_comment = h.get("comment_text") is not None
@@ -108,7 +121,7 @@ def fetch_reddit(terms: list[str], since: datetime, cfg: dict, limit: int = 100)
     try:
         token = _reddit_token(cfg["client_id"], cfg["client_secret"], cfg["user_agent"])
     except Exception as e:
-        print(f"  [Reddit] auth failed ({e}); skipping Reddit this run.")
+        _note_error(f"[Reddit] auth failed ({e}); skipping Reddit this run.")
         return []
     headers = {"Authorization": f"Bearer {token}", "User-Agent": cfg["user_agent"]}
     out: list[Mention] = []
@@ -119,7 +132,7 @@ def fetch_reddit(terms: list[str], since: datetime, cfg: dict, limit: int = 100)
         try:
             data = _get_json(url, headers=headers)
         except Exception as e:
-            print(f"  [Reddit] error for '{term}': {e}")
+            _note_error(f"[Reddit] error for '{term}': {e}")
             continue
         for c in data.get("data", {}).get("children", []):
             d = c.get("data", {})
@@ -168,7 +181,7 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict) -> list[Mention]
     try:
         data = _get_json(url, headers=headers)
     except Exception as e:
-        print(f"  [X] error: {e}")
+        _note_error(f"[X] fetch error: {e}")
         return []
     users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
     out: list[Mention] = []
@@ -297,7 +310,7 @@ def fetch_news(terms, since, cfg) -> list[Mention]:
         try:
             raw += _fetch_rss(term)
         except Exception as e:
-            print(f"  [News] error for '{term}': {e}")
+            _note_error(f"[News] fetch error for '{term}': {e}")
     # de-dupe identical links, keep within time window
     seen_links, articles = set(), []
     for a in raw:
@@ -503,6 +516,7 @@ def fetch_article_text(url, limit=2000):
 def ai_classify(mentions, llm_cfg):
     provider = llm_cfg.get("provider", "anthropic")
     model = llm_cfg["model"]
+    escalate_model = llm_cfg.get("escalate_model", "")
     api_key = llm_cfg["api_key"]
     batch = int(llm_cfg.get("batch_size", 15))
     get_article = llm_cfg.get("fetch_article_text", True)
@@ -518,31 +532,46 @@ def ai_classify(mentions, llm_cfg):
                 if body:
                     m.metrics["article_excerpt"] = body[:1200]
 
-    for start in range(0, len(mentions), batch):
-        chunk = mentions[start:start + batch]
-        posts = [{"i": i, "platform": m.platform, "author": m.author or m.author_name,
-                  "text": m.text[:600],
-                  "article_excerpt": m.metrics.get("article_excerpt", "")[:900]}
-                 for i, m in enumerate(chunk)]
-        prompt = (f"{_INSTR}\n\nPosts:\n{json.dumps(posts, ensure_ascii=False)}")
-        try:
-            raw = (_anthropic_call if provider == "anthropic" else _openai_call)(api_key, model, prompt)
-            results = {r["i"]: r for r in _extract_json(raw)}
-        except Exception as e:
-            print(f"  [AI] batch failed ({e}); falling back to keywords for this batch.")
-            keyword_fallback(chunk)
-            continue
-        for i, m in enumerate(chunk):
-            r = results.get(i)
-            if not r:
-                m.relevant, m.sentiment = True, keyword_sentiment(m)
-                m.summary = m.text[:140]
+    def _label(items, use_model):
+        """Classify a list of mentions in batches with the given model."""
+        for start in range(0, len(items), batch):
+            chunk = items[start:start + batch]
+            posts = [{"i": i, "platform": m.platform, "author": m.author or m.author_name,
+                      "text": m.text[:600],
+                      "article_excerpt": m.metrics.get("article_excerpt", "")[:900]}
+                     for i, m in enumerate(chunk)]
+            prompt = (f"{_INSTR}\n\nPosts:\n{json.dumps(posts, ensure_ascii=False)}")
+            try:
+                raw = (_anthropic_call if provider == "anthropic" else _openai_call)(api_key, use_model, prompt)
+                results = {r["i"]: r for r in _extract_json(raw)}
+            except Exception as e:
+                _note_error(f"[AI] batch failed on model '{use_model}' ({e}); "
+                            f"keyword fallback for {len(chunk)} item(s).")
+                keyword_fallback(chunk)
                 continue
-            m.relevant = bool(r.get("about_aifp", True))
-            m.sentiment = r.get("sentiment", "neutral")
-            m.stance = r.get("stance", "")
-            m.theme = r.get("theme", "")
-            m.summary = r.get("summary", "")
+            for i, m in enumerate(chunk):
+                r = results.get(i)
+                if not r:
+                    m.relevant, m.sentiment = True, keyword_sentiment(m)
+                    m.summary = m.text[:140]
+                    continue
+                m.relevant = bool(r.get("about_aifp", True))
+                m.sentiment = r.get("sentiment", "neutral")
+                m.stance = r.get("stance", "")
+                m.theme = r.get("theme", "")
+                m.summary = r.get("summary", "")
+
+    # Pass 1 — cheap, fast model over everything.
+    _label(mentions, model)
+
+    # Pass 2 — re-judge only the high-stakes items (the ones that drive
+    # CRITICAL / WARNING alerts) with the stronger model, for higher fidelity.
+    if escalate_model and escalate_model not in ("", "FILL IN"):
+        escalate = [m for m in mentions if m.relevant and
+                    (m.sentiment in ("negative", "mixed") or m.stance == "substantive_critique")]
+        if escalate:
+            print(f"  [AI] escalating {len(escalate)} item(s) to {escalate_model}.")
+            _label(escalate, escalate_model)
     return mentions
 
 
@@ -962,9 +991,13 @@ def load_config(path):
     with open(path) as f:
         return _env_overlay(yaml.safe_load(f))
 def run(config, dry_run=False, mentions=None, state_dir="."):
+    _ERRORS.clear()
     since = datetime.now(timezone.utc) - timedelta(hours=config.get("lookback_hours", 6))
     if mentions is None: mentions = fetch_all(config, since)
     print(f"Fetched {len(mentions)} raw mentions.")
+    _llm = config.get("llm", {})
+    if _llm.get("enabled") and _llm.get("api_key", "") in ("", "FILL IN"):
+        _note_error("ANTHROPIC_API_KEY not set — running keyword-only classification (low fidelity).")
     mentions = classify(mentions, config); print(f"{len(mentions)} judged relevant.")
     new = filter_new(mentions, state_dir); print(f"{len(new)} new since last run.")
     score_mentions(new, config); agg = aggregate(new, config)
@@ -973,6 +1006,24 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     record_timeseries(agg, new, state_dir)
     title = config.get("slack", {}).get("digest_title", "Plan A monitor")
     mode = config.get("mode", "alerts")
+    wh = config.get("slack", {}).get("webhook_url", "")
+    live = not (dry_run or not wh or wh == "FILL IN")
+
+    # Health check: if anything failed this run (a source error, an AI
+    # fallback, a missing key), ping the operator — never degrade silently.
+    if _ERRORS:
+        notify_id = config.get("slack", {}).get("error_notify", "")
+        ping = ((f"<@{notify_id}> " if notify_id else "")
+                + f"⚠️ *Plan A monitor* hit {len(_ERRORS)} issue(s) this run:\n"
+                + "\n".join(f"• {e}" for e in _ERRORS[:20]))
+        if live:
+            try:
+                post_to_slack(wh, ping); print(f"Posted health warning ({len(_ERRORS)} issue(s)).")
+            except Exception as e:
+                print(f"  [health] could not post error ping: {e}")
+        else:
+            print("\n" + "-"*70 + "\nHEALTH (dry run)\n" + "-"*70 + "\n" + ping)
+
     if mode == "digest":
         message = build_digest(new, agg, spike, ratio, baseline, title)
     else:
@@ -981,11 +1032,10 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
         if not (individual or patterns or narr):
             print("Nothing noteworthy this run — staying quiet."); return None
         message = build_alert(reasons, individual, patterns, narr, title)
-    wh = config.get("slack", {}).get("webhook_url", "")
-    if dry_run or not wh or wh == "FILL IN":
-        print("\n"+"="*70+f"\n{mode.upper()} (dry run)\n"+"="*70+"\n"+message)
-    else:
+    if live:
         post_to_slack(wh, message); print(f"Posted {mode} to Slack.")
+    else:
+        print("\n"+"="*70+f"\n{mode.upper()} (dry run)\n"+"="*70+"\n"+message)
     return message
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--config", default="config.yaml")
