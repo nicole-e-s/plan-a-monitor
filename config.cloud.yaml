@@ -176,6 +176,10 @@ thresholds:
     likes: 25
     reposts: 8
     author_followers: 20000
+    # A single tweet clearing this many impressions is "worth addressing" on
+    # its own, even from a non-watchlist account. Starting guess — calibrate on
+    # live traffic. (Edit this number in the GitHub web UI to tune sensitivity.)
+    impressions: 10000
   reddit:
     score: 15
     num_comments: 10
@@ -257,4 +261,9 @@ slack:
   # Slack member ID pinged when the monitor errors out or silently degrades
   # (e.g. the AI model fails and it falls back to keyword-only sentiment):
   error_notify: U0BED0HLDLL
+  # People pinged for WARNING alerts + influential positive/neutral posts —
+  # i.e. anything "we should respond to." Slack member IDs (not @names):
+  respond_notify:
+  - U08QWKU8CJY   # Lauren Mangla
+  - U08PH68S2AU   # Nicole Sanna
 lookback_hours: 1

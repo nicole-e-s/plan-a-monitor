@@ -203,7 +203,8 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict) -> list[Mention]
                 if t.get("created_at") else None,
             engagement=int(pm.get("like_count", 0)) + 2 * int(pm.get("retweet_count", 0)) + int(pm.get("quote_count", 0)),
             metrics={"likes": pm.get("like_count", 0), "reposts": pm.get("retweet_count", 0),
-                     "quotes": pm.get("quote_count", 0), "replies": pm.get("reply_count", 0)},
+                     "quotes": pm.get("quote_count", 0), "replies": pm.get("reply_count", 0),
+                     "impressions": pm.get("impression_count", 0)},
         ))
     return out
 
@@ -619,7 +620,8 @@ def score_mentions(mentions, config):
         p = m.metrics
         if m.platform == "twitter":
             if p.get("likes", 0) >= th["twitter"]["likes"] or p.get("reposts", 0) >= th["twitter"]["reposts"] \
-               or (m.author_followers or 0) >= th["twitter"]["author_followers"]:
+               or (m.author_followers or 0) >= th["twitter"]["author_followers"] \
+               or p.get("impressions", 0) >= th["twitter"].get("impressions", 10**12):
                 tier = "high"
         elif m.platform == "reddit":
             if p.get("score", 0) >= th["reddit"]["score"] or p.get("num_comments", 0) >= th["reddit"]["num_comments"]:
@@ -862,7 +864,8 @@ def _engagement_str(m):
     p = m.metrics
     if m.platform == "twitter":
         f = f", {m.author_followers:,} followers" if m.author_followers else ""
-        return f"{p.get('likes',0)} likes / {p.get('reposts',0)} reposts{f}"
+        imp = f", {p.get('impressions',0):,} impressions" if p.get('impressions') else ""
+        return f"{p.get('likes',0)} likes / {p.get('reposts',0)} reposts{imp}{f}"
     if m.platform == "reddit":
         return f"{p.get('score',0)} upvotes / {p.get('num_comments',0)} comments (r/{p.get('subreddit','')})"
     if m.platform == "hackernews":
@@ -953,6 +956,106 @@ def build_alert(reasons, individual, pattern_themes, narratives, title):
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# Tiered alert routing — the CRITICAL / WARNING / heads-up scheme.
+# who × sentiment -> tier.  color = Slack attachment sidebar; ping = who to @.
+# --------------------------------------------------------------------------
+TIER_STYLE = {
+    "critical": {"label": "CRITICAL", "emoji": "🔴", "color": "#C0392B", "ping": "channel"},
+    "warning":  {"label": "WARNING",  "emoji": "🟠", "color": "#E67E22", "ping": "responders"},
+    "positive": {"label": "Positive — influential", "emoji": "🟢", "color": "#2ECC71", "ping": "responders"},
+    "neutral":  {"label": "Heads-up — key figure",  "emoji": "⚪", "color": "#B0B0B0", "ping": "responders"},
+}
+_TIER_ORDER = ["critical", "warning", "positive", "neutral"]
+
+
+def _individual_tier(m, watchlist):
+    """Tier for a post that stands on its own — a watchlist author, or a post
+    that cleared the attention bar (score_mentions set tier high/critical).
+    Returns None if it isn't alert-worthy alone (it still feeds the aggregates)."""
+    key_figure = _watch_hit(m, watchlist) is not None or m.tier in ("critical", "high")
+    if not key_figure:
+        return None
+    if m.sentiment in ("negative", "mixed"):
+        return "critical"
+    if m.sentiment == "positive":
+        return "positive"
+    return "neutral"
+
+
+def _pings(tier_key, responders):
+    if TIER_STYLE[tier_key]["ping"] == "channel":
+        return "<!channel>"
+    return " ".join(f"<@{u}>" for u in responders)
+
+
+def _tier_payload(tier_key, items, reasons, responders, title):
+    style = TIER_STYLE[tier_key]
+    header = f"{_pings(tier_key, responders)} {style['emoji']} *{style['label']}* — {title}".strip()
+    lines = []
+    if reasons:
+        lines.append("_" + "; ".join(reasons) + "_")
+    for m in sorted(items, key=lambda x: x.priority, reverse=True)[:12]:
+        lines.append(_item_line(m))
+    if len(items) > 12:
+        lines.append(f"…and {len(items) - 12} more.")
+    body = "\n".join(lines) if lines else "_(no example posts)_"
+    return {
+        "text": header,  # the @-mention must live in top-level text to notify
+        "attachments": [{"color": style["color"], "text": body,
+                         "mrkdwn_in": ["text"], "fallback": style["label"]}],
+    }
+
+
+def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
+    """One batched, colour-coded Slack message per fired tier; empty list (i.e.
+    stay silent) when nothing fires."""
+    watchlist = config.get("watchlist", [])
+    responders = config.get("slack", {}).get("respond_notify", [])
+    title = config.get("slack", {}).get("digest_title", "Plan A monitor")
+
+    # 1) individual posts that alert on their own, deduped so we don't re-ping.
+    alertable = [m for m in new if _individual_tier(m, watchlist)]
+    alertable = filter_unalerted(alertable, state_dir, config.get("escalate_factor", 4.0))
+    by_tier = defaultdict(list)
+    for m in alertable:
+        by_tier[_individual_tier(m, watchlist)].append(m)
+
+    # 2) aggregate negativity -> WARNING (surge / narrative / small-post cluster
+    #    / spike). Examples shown are the SMALL negatives; the big ones already
+    #    went out as CRITICAL, so nothing double-posts.
+    warn_reasons = []
+    negs = [m for m in new if m.sentiment in ("negative", "mixed")]
+    if len(negs) >= int(config.get("neg_surge_count", 5)):
+        warn_reasons.append(f"negativity surge — {len(negs)} negative mentions this window")
+    for n in agg.get("narratives", []):
+        if n.get("alert"):
+            warn_reasons.append(f"narrative '{n['label']}' — {n['count']} mentions")
+    cluster_bar = int(config.get("cluster_alert_count", 6))
+    for t in agg.get("themes", []):
+        if t["count"] >= cluster_bar and t.get("mostly_small"):
+            warn_reasons.append(f"pattern '{t['theme']}' — {t['count']} small posts, {t['neg_pct']}% neg")
+    if spike:
+        warn_reasons.append(f"volume spike {ratio}× normal")
+
+    payloads = []
+    for tier_key in _TIER_ORDER:
+        if tier_key == "warning":
+            if warn_reasons:
+                small = [m for m in negs if _individual_tier(m, watchlist) is None]
+                payloads.append(_tier_payload("warning", small, warn_reasons, responders, title))
+        elif by_tier.get(tier_key):
+            payloads.append(_tier_payload(tier_key, by_tier[tier_key], None, responders, title))
+    return payloads
+
+
+def post_slack_payload(webhook_url, payload):
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(webhook_url, data=body,
+                                 headers={"content-type": "application/json"})
+    urllib.request.urlopen(req, timeout=20).read()
+
+
 def post_to_slack(webhook_url, text):
     for chunk in _chunk(text, 3500):
         body = json.dumps({"text": chunk}).encode()
@@ -1026,17 +1129,26 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
 
     if mode == "digest":
         message = build_digest(new, agg, spike, ratio, baseline, title)
-    else:
-        triggered, reasons, individual, patterns, narr = compute_triggers(new, agg, spike, ratio, config)
-        individual = filter_unalerted(individual, state_dir, config.get("escalate_factor", 4.0))
-        if not (individual or patterns or narr):
-            print("Nothing noteworthy this run — staying quiet."); return None
-        message = build_alert(reasons, individual, patterns, narr, title)
+        if live:
+            post_to_slack(wh, message); print("Posted digest to Slack.")
+        else:
+            print("\n"+"="*70+"\nDIGEST (dry run)\n"+"="*70+"\n"+message)
+        return message
+
+    # alerts mode — tiered routing: one batched, colour-coded message per fired
+    # tier (CRITICAL/WARNING/positive/heads-up), silent when nothing fires.
+    payloads = build_tier_payloads(new, agg, spike, ratio, config, state_dir)
+    if not payloads:
+        print("Nothing noteworthy this run — staying quiet."); return None
     if live:
-        post_to_slack(wh, message); print(f"Posted {mode} to Slack.")
+        for p in payloads:
+            post_slack_payload(wh, p)
+        print(f"Posted {len(payloads)} tier alert(s) to Slack.")
     else:
-        print("\n"+"="*70+f"\n{mode.upper()} (dry run)\n"+"="*70+"\n"+message)
-    return message
+        print("\n"+"="*70+f"\nALERTS (dry run) — {len(payloads)} message(s)\n"+"="*70)
+        for p in payloads:
+            print(f"\n▸ {p['text']}\n{p['attachments'][0]['text']}")
+    return payloads
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--dry-run", action="store_true"); args = ap.parse_args()
