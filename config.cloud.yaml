@@ -198,6 +198,11 @@ sources:
     client_id: FILL IN
     client_secret: FILL IN
     user_agent: plan-a-monitor by u/yourusername
+  reddit_rss:
+    # Public Reddit search RSS — needs NO app/credentials (the official API is
+    # now approval-gated). May get IP-blocked when run from GitHub Actions; if
+    # so, the run log shows "[Reddit-RSS] error" and we fall back to no Reddit.
+    enabled: true
   twitter:
     enabled: false
     bearer_token: FILL IN
@@ -267,3 +272,24 @@ slack:
   - U08QWKU8CJY   # Lauren Mangla
   - U08PH68S2AU   # Nicole Sanna
 lookback_hours: 1
+# Per-source lookback overrides:
+twitter_lookback_minutes: 10      # keep X reads cheap (pay-per-use): small overlap with the 5-min cron
+reddit_rss_lookback_hours: 6
+substack_lookback_hours: 24       # blog posts are infrequent; dedupe stops re-alerts
+# Substack / personal-blog RSS feeds, one per watchlist person (author is forced
+# to the name so the watchlist matcher fires). Add/remove in the GitHub web UI.
+substack_feeds:
+  David Sacks: https://sacks.substack.com/feed
+  Sriram Krishnan: https://sriramk.substack.com/feed
+  Dean Ball: https://www.hyperdimensional.co/feed
+  Matt Yglesias: https://www.slowboring.com/feed
+  Ezra Klein: https://feeds.simplecast.com/kEKXbjuJ
+  Ross Douthat: https://douthat.substack.com/feed
+  Dwarkesh Patel: https://www.dwarkesh.com/feed
+  Kevin Roose: https://kevinroose.substack.com/feed
+  Zvi Mowshowitz: https://thezvi.wordpress.com/feed/
+  Jack Clark: https://importai.substack.com/feed
+  Nate Silver: https://www.natesilver.net/feed
+  Helen Toner: https://helentoner.substack.com/feed
+  Tyler Cowen: https://marginalrevolution.com/feed
+  Shakeel Hashim: https://www.transformernews.ai/feed

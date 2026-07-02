@@ -211,6 +211,7 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict) -> list[Mention]
 
 def fetch_all(config: dict, since: datetime) -> list[Mention]:
     terms = [t["query"] for t in config["search_terms"]]
+    now = datetime.now(timezone.utc)
     mentions: list[Mention] = []
     src = config["sources"]
     if src.get("hackernews", {}).get("enabled"):
@@ -219,12 +220,23 @@ def fetch_all(config: dict, since: datetime) -> list[Mention]:
     if src.get("reddit", {}).get("enabled"):
         print("Fetching Reddit…")
         mentions += fetch_reddit(terms, since, src["reddit"])
+    if src.get("reddit_rss", {}).get("enabled"):
+        print("Fetching Reddit (RSS)…")
+        rr_since = now - timedelta(hours=config.get("reddit_rss_lookback_hours", 6))
+        mentions += fetch_reddit_rss(terms, rr_since)
     if src.get("twitter", {}).get("enabled"):
         print("Fetching X/Twitter…")
-        mentions += fetch_twitter(terms, since, src["twitter"])
+        # X is pay-per-use, so keep the window small (little overlap with the
+        # 5-min cron) to avoid re-reading — and re-paying for — the same tweets.
+        tw_since = now - timedelta(minutes=config.get("twitter_lookback_minutes", 10))
+        mentions += fetch_twitter(terms, tw_since, src["twitter"])
     if src.get("news", {}).get("enabled"):
         print("Fetching news…")
         mentions += fetch_news(terms, since, src["news"])
+    if config.get("substack_feeds"):
+        print("Fetching Substack/blogs…")
+        sub_since = now - timedelta(hours=config.get("substack_lookback_hours", 24))
+        mentions += fetch_substack(config["substack_feeds"], sub_since)
     return mentions
 
 # ===== from news.py =====
@@ -359,6 +371,123 @@ def fetch_news(terms, since, cfg) -> list[Mention]:
                      "pickup_count": pickup, "also_covered": others[:10]},
         ))
     return out
+
+# --------------------------------------------------------------------------
+# Generic RSS / Atom sources — Substack & personal blogs (per watchlist person)
+# and Reddit's PUBLIC search RSS (no app/credentials; the official API is now
+# approval-gated). Both parse the same way.
+# --------------------------------------------------------------------------
+_FEED_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _feed_get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": _FEED_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _feed_date(s):
+    if not s:
+        return None
+    s = s.strip()
+    dt = None
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M %z"):
+        try:
+            dt = datetime.strptime(s, fmt); break
+        except Exception:
+            pass
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_feed(raw):
+    """Parse an RSS 2.0 (<item>) or Atom (<entry>) feed into simple dicts."""
+    out = []
+    try:
+        root = ET.fromstring(raw)
+    except Exception:
+        return out
+    tag = lambda el: el.tag.split("}")[-1]
+    for it in root.iter():
+        if tag(it) not in ("item", "entry"):
+            continue
+        d = {"title": "", "link": "", "author": "", "date": None, "summary": ""}
+        for ch in it:
+            ct = tag(ch)
+            if ct == "title":
+                d["title"] = (ch.text or "").strip()
+            elif ct == "link" and not d["link"]:
+                d["link"] = (ch.text or ch.get("href") or "").strip()
+            elif ct in ("creator", "author") and not d["author"]:
+                name = ""
+                for sub in ch:
+                    if tag(sub) == "name":
+                        name = (sub.text or "").strip()
+                d["author"] = name or (ch.text or "").strip()
+            elif ct in ("pubDate", "published", "updated") and not d["date"]:
+                d["date"] = _feed_date(ch.text)
+            elif ct in ("summary", "description", "content") and not d["summary"]:
+                d["summary"] = re.sub(r"<[^>]+>", " ", (ch.text or "")).strip()[:500]
+        out.append(d)
+    return out
+
+
+def fetch_substack(feeds_map, since, limit=15):
+    """One feed per watchlist person; author is forced to the person's name so
+    the watchlist matcher fires (their importance is the signal)."""
+    out = []
+    for name, url in (feeds_map or {}).items():
+        try:
+            items = _parse_feed(_feed_get(url))
+        except Exception as e:
+            print(f"  [Substack] {name} feed error: {e}")
+            continue
+        for it in items[:limit]:
+            if it["date"] and it["date"] < since:
+                continue
+            link = it["link"]
+            out.append(Mention(
+                platform="substack", id=link or (name + it["title"][:40]),
+                url=link, text=(it["title"] + "\n" + it["summary"]).strip(),
+                author=name, author_name=name, created_at=it["date"],
+                metrics={"outlet": name, "source": "substack"}))
+        time.sleep(0.2)
+    return out
+
+
+def fetch_reddit_rss(terms, since, limit=50):
+    """Public Reddit search RSS — no credentials. ONE combined OR query keeps us
+    under Reddit's aggressive RSS rate limit (per-term hammering hits 429).
+    Engagement isn't exposed here, so these feed volume/sentiment/narrative
+    signals rather than solo alerts."""
+    out = []
+    query = " OR ".join(f'"{t}"' for t in terms)
+    q = urllib.parse.quote(query)
+    url = f"https://www.reddit.com/search.rss?q={q}&sort=new&limit={limit}"
+    try:
+        items = _parse_feed(_feed_get(url))
+    except Exception as e:
+        print(f"  [Reddit-RSS] error: {e}")
+        return out
+    for it in items:
+        if it["date"] and it["date"] < since:
+            continue
+        link = it["link"]
+        author = (it["author"] or "").rsplit("/", 1)[-1]
+        out.append(Mention(
+            platform="reddit", id=link or it["title"][:60],
+            url=link, text=(it["title"] + "\n" + it["summary"]).strip(),
+            author=author, created_at=it["date"], engagement=0,
+            metrics={"source": "reddit_rss"}))
+    return out
+
 
 # ===== from relevance.py =====
 
@@ -527,7 +656,7 @@ def ai_classify(mentions, llm_cfg):
     if get_article:
         for m in mentions:
             url = m.metrics.get("article_url") if m.platform == "hackernews" else (
-                m.url if m.platform == "news" else None)
+                m.url if m.platform in ("news", "substack") else None)
             if url:
                 body = fetch_article_text(url)
                 if body:
@@ -874,6 +1003,8 @@ def _engagement_str(m):
         tier = {1: "tier-1", 2: "tier-2"}.get(p.get("tier"), "other")
         extra = f", +{p.get('pickup_count',1)-1} more outlets" if p.get("pickup_count", 1) > 1 else ""
         return f"{p.get('outlet','')} ({tier}){extra}"
+    if m.platform == "substack":
+        return f"{p.get('outlet','')} · blog/substack"
     return f"{m.engagement} engagement"
 
 
