@@ -5,8 +5,19 @@ search_terms:
   precision: high
 - query: Daniel Kokotajlo
   precision: high
+- query: Eli Lifland
+  precision: high
+# "low" = a common-ish name/phrase: it only counts when AIFP context words
+# appear nearby, and the AI double-checks relevance.
+- query: Thomas Larsen
+  precision: low
+# hashtag form (#AI2040) — the spaced phrase "AI 2040" doesn't match it on X
+- query: AI2040
+  precision: high
 - query: ai-2040.com
   precision: high
+# (Scott Alexander is deliberately NOT a search term — his name generates far
+#  too many unrelated hits. "Plan A" was removed 2026-07-02 for the same reason.)
 # ("Plan A" was removed 2026-07-02 — far too many false positives: "plan a
 #  trip", "plan a variety show", etc. "AI 2040"/"ai-2040.com" cover the title.)
 - query: AI 2027
