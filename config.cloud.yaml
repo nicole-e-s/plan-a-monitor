@@ -190,6 +190,17 @@ spike_factor: 3.0
 cluster_alert_count: 6
 neg_surge_count: 5
 escalate_factor: 4.0
+# --- slow-building narrative detection ---
+# Besides the per-window alert_count above, a narrative also WARNs when its
+# TOTAL mentions over the last narrative_build_days reach 3x its alert_count
+# (override per narrative with build_count). Catches a drip of criticism that
+# never spikes in any single 5-minute window.
+narrative_build_days: 3
+narrative_build_cooldown_hours: 12   # don't re-warn about the same build more often than this
+# --- once-a-day summary post (grey, no pings) ---
+daily_digest:
+  enabled: true
+  hour_utc: 23   # 23:00 UTC = 4 PM PDT (daylight time; set to 0 for 4 PM PST in winter)
 sources:
   hackernews:
     enabled: true

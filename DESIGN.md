@@ -25,18 +25,27 @@ It exists to solve the **"AI 2027 problem"**: last time, negative discourse ("th
 | Single viral post | A no-name tweet blows up | Attention bar (impressions / engagement) |
 | Volume spike | Sudden flood of mentions | Rate vs. rolling baseline |
 | Negativity surge | Many negative posts at once | Count of negatives in a window |
-| Slow-building narrative | "It's unscientific" accretes over days | Multi-day narrative tracking *(to build)* |
+| Slow-building narrative | "It's unscientific" accretes over days | Rolling multi-day narrative totals (§7) |
 
 ## 4. Sources
 
 | Source | Role | Status |
 |---|---|---|
-| **X/Twitter (API, pay-per-use)** | Primary. Broad keyword search **+** per-watchlist `from:` queries. | App `aifp_scraper` created; **TODO** buy credits + set spend limit → add `X_BEARER_TOKEN`. X ended new Basic/Pro signups — it's ~$0.005/read now. |
-| **Substack / blogs (RSS)** | Longform reactions from watchlist people | Feeds mapped (§6); **TODO** build the RSS fetcher |
+| **X/Twitter (API, pay-per-use)** | Primary. Broad keyword search **+** direct `from:` polling of every watchlist account (catches subtweets that never name the project). | ✅ live — app `aifp_scraper`, `X_BEARER_TOKEN` set, $500 credits, $1,000/mo spend cap. ~$0.005/read; 10-min read window keeps cost low (X ended new Basic/Pro signups — pay-per-use is the only option). |
+| **Substack / blogs (RSS)** | Longform reactions from watchlist people | ✅ live — 14 per-person feeds wired (§6) |
 | **Hacker News (Algolia)** | Article discussion + comment sentiment | ✅ live |
 | **Google News (RSS)** | Detects article pickup / syndication | ✅ live (English/US) |
-| **Reddit** | Community reaction | Code wired, but Reddit **disabled self-serve API app creation** (2026) — now needs a developer access-request + approval (uncertain, high rejection). **Deprioritized for launch.** |
+| **Reddit (public search RSS)** | Community reaction — **partial coverage, see extent note below** | ✅ live, best-effort. Official Data API application pending. |
 | **Non-English news** | Foreign-language coverage | Post-launch |
+
+**Reddit access — exact extent.** Reddit closed self-serve API registration in 2026 ("Responsible Builder Policy"), so current coverage comes from Reddit's **public search RSS**, which is materially weaker than real API access. Specifically:
+
+1. **Posts only** — submissions turn up in search RSS; **comments do not**. A hostile comment thread under someone else's post is invisible to us until/unless it becomes its own post or shows up elsewhere.
+2. **No engagement data** — RSS exposes no upvote/comment counts, so Reddit items feed volume, sentiment, and narrative detection but can **never fire a solo "high-attention post" alert**.
+3. **Best-effort reliability** — Reddit aggressively rate-limits RSS (HTTP 429), especially from datacenter IPs like GitHub Actions'. Some runs will fetch nothing; errors are logged in the run output, not alerted.
+4. One combined OR query per run (not per-term) to minimize throttling.
+
+If the pending official Data API application is approved, adding `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` secrets auto-enables the full source (posts **and** comments, with engagement) alongside the RSS fallback — no code change.
 
 ## 5. Pipeline
 
@@ -49,6 +58,8 @@ Deliberately **cost-asymmetric**: the expensive step (AI) only runs on posts tha
 ## 6. Watchlist & channel map
 
 Watchlist authors alert **regardless of engagement** — their importance is the signal. **17 people** (5 critical, 12 high). Handles + feeds researched below.
+
+Coverage is threefold: their **X accounts are polled directly** (`from:` queries every run, so a subtweet that never names the project is still caught), their **Substack/blog feeds** are read, and any **article or post that features them by name** counts as a watchlist hit (labeled `[features X]` — news "authors" are outlets, so an Ezra Klein column or a piece quoting Vance would otherwise never match).
 
 | Name | Weight | X handle | Substack/blog feed | Note |
 |---|---|---|---|---|
@@ -70,7 +81,7 @@ Watchlist authors alert **regardless of engagement** — their importance is the
 | Shakeel Hashim | high | @ShakeelHashim | `transformernews.ai/feed` | live |
 | Leopold Aschenbrenner | high | @leopoldasch | — | essay site has no feed → rely on X; handle newly found |
 
-**TODO:** confirm completeness with comms (more names to add); wire the feeds when the Substack source is built.
+**TODO:** confirm completeness with comms (more names to add). All 14 feeds are wired and live in `config.cloud.yaml` → `substack_feeds`.
 
 ## 7. Alert tiers & Slack routing
 
@@ -87,9 +98,10 @@ Watchlist authors alert **regardless of engagement** — their importance is the
 - Member IDs (display names don't notify): **Lauren `<@U08QWKU8CJY>`**, **Nicole `<@U08PH68S2AU>`**; `@channel` = `<!channel>`.
 - **Aesthetics:** colored attachment sidebars / Block Kit per tier, with a **plain-text fallback** so formatting can never drop an alert.
 - **Batching:** alerts grouped **per 5-min window per tier** (one message listing what crossed the bar); **silent if the window is empty**.
-- **Daily digest:** one GENERAL (no-ping) summary per day at **4:00 PM PDT (23:00 UTC)**.
+- **Daily digest:** one GENERAL (no-ping) summary per day at **4:00 PM PDT (23:00 UTC)** — last-24h volume, sentiment split, top themes, notable posts.
+- **Slow-build narratives:** WARNING also fires when a narrative's rolling total over the last **3 days** reaches its build bar (default **3× its per-window `alert_count`**), with a 12-hour cooldown so it doesn't re-warn every 5 minutes. This catches the drip of criticism that never spikes in any single window.
 
-*Status: routing/colors/batching/digest still to build; core alert engine exists.*
+*Status: all implemented — routing, colors, pings, batching, daily digest, slow-build detection, featured-in-article matching.*
 
 ## 8. Thresholds & tuning
 
@@ -115,9 +127,9 @@ Static GitHub Pages reading `timeseries.json`: volume + sentiment over time + re
 
 - **Repo:** runs from the handler's repo (`nicole-e-s/plan-a-monitor`); Dillon has push access.
 - **Schedule:** GitHub Actions cron, **every 5 min**; state committed back each run.
-- **Secrets** (GitHub → Settings → Secrets and variables → Actions — *never in code/YAML*): `SLACK_WEBHOOK_URL` ✅, `ANTHROPIC_API_KEY` ✅, `X_BEARER_TOKEN` TODO, `REDDIT_CLIENT_ID`/`SECRET` TODO. X/Reddit auto-enable when their secrets exist.
+- **Secrets** (GitHub → Settings → Secrets and variables → Actions — *never in code/YAML*): `SLACK_WEBHOOK_URL` ✅, `ANTHROPIC_API_KEY` ✅, `X_BEARER_TOKEN` ✅ ($500 credits, $1,000/mo cap), `REDDIT_CLIENT_ID`/`SECRET` pending Reddit's application review (RSS coverage needs none). X/Reddit auto-enable when their secrets exist.
 - **Cron reliability:** GitHub cron is best-effort (can lag/skip). The design is resilient — the 1-hour lookback + dedupe means a skipped run is recovered on the next one (latency, not data loss). Launch day: keep the manual "Run workflow" button (or an external trigger) as backup.
-- **Repo privacy (decision pending):** going private hides the code + config (strategy), but note two costs — (a) **Pages needs GitHub Pro+**, and the published dashboard **stays public** anyway (only Enterprise makes the page access-controlled); (b) **private-repo Actions minutes are capped** (Free 2k / Pro 3k / Team 50k per month; $0.006/min overage), and a 5-min cron uses ~9k–17k min/month → expect overage (~$40–90/mo, trivial vs X) **or a silent stop when the quota runs out**. Public repos get unlimited free Actions. *Recommended if going private:* enable Actions billing so the cron never silently stops, and either accept a public dashboard URL (Pro) or split the dashboard into a separate tiny public repo holding only `dashboard.html` + `timeseries.json`.
+- **Repo privacy — DECIDED: stay public through launch.** Rationale: (a) ownership transfer takes time we don't have; (b) **Pages needs GitHub Pro+ on a private repo, and the published dashboard stays public anyway** (only Enterprise gates the page) — so privating loses the free dashboard without actually hiding it; (c) **private-repo Actions minutes are capped** (Free 2k/mo vs our ~9k–17k at a 5-min cadence) — overage billing or, worse, **a silent cron stop mid-launch**; public repos get unlimited free Actions; (d) what's exposed is modest: code, config, aggregate counts, links to already-public posts. The one real sensitivity is the **watchlist being publicly readable**; if comms objects, the cheap fix is moving the watchlist into an Actions secret (post-launch, no repo change) rather than privating the repo. Revisit after launch week.
 
 ## 13. Security & privacy
 
@@ -128,18 +140,20 @@ Secrets live only as encrypted GitHub Actions secrets, never in code/config. If 
 - [x] Fix model id → tiered Haiku/Sonnet
 - [x] Health/self-monitoring ping on silent failures
 - [x] Add Leopold + fill Kratsios/Leopold handles
-- [ ] Build tiered Slack routing (colors, pings, per-window batching, silent-if-empty)
-- [ ] Build Substack RSS source + wire the channel-map feeds
-- [ ] Daily digest at 4 PM PDT (23:00 UTC)
-- [ ] X: choose account → subscribe Pro → add `X_BEARER_TOKEN`
-- [ ] Reddit: create "script" app → add creds
-- [ ] Decide repo privacy (see §12)
-- [ ] Multi-day narrative tracking
-- [ ] Fix watchlist-matching on articles (news author = outlet, not person)
+- [x] Tiered Slack routing (colors, pings, per-window batching, silent-if-empty)
+- [x] Substack RSS source — 14 channel-map feeds wired
+- [x] Daily digest at 4 PM PDT (23:00 UTC)
+- [x] X: `aifp_scraper` app, pay-per-use credits + spend cap, `X_BEARER_TOKEN` set
+- [x] Reddit interim coverage via public search RSS (see extent note, §4)
+- [x] Multi-day narrative build tracking (rolling 3-day totals + cooldown)
+- [x] Watchlist matching on articles (`[features X]`) + direct X polling of watchlist accounts
+- [x] Repo privacy decided: stay public through launch (§12)
+- [ ] Submit Reddit official Data API application; add creds if approved
 - [ ] Confirm/expand watchlist with comms; tune thresholds in the quiet window
+- [ ] Verify Kevin Roose feed (reported move from NYT to Substack)
 
 ## 15. Phasing
 
-- **Launch:** X (Pro), HN, News, Substack; tiered models; tiered/batched Slack alerts; dashboard; config-tuned thresholds; health pings.
-- **Fast-follow:** Reddit; more watchlist people; threshold calibration from real data.
-- **Post-launch:** non-English; multi-day narrative refinements; repo-privacy cleanup.
+- **Launch (now live):** X pay-per-use (broad + watchlist polling), HN, Google News, Substack, Reddit-RSS; tiered models; tiered/batched Slack alerts; daily digest; slow-build narrative detection; dashboard; config-tuned thresholds; health pings.
+- **Fast-follow:** official Reddit API if approved; more watchlist people; threshold calibration from real launch data.
+- **Post-launch:** non-English coverage; watchlist-in-secret if comms wants it hidden; repo-privacy revisit.

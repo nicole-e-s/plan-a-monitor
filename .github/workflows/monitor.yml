@@ -2,7 +2,7 @@ name: Plan A monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -33,7 +33,7 @@ jobs:
         run: |
           git config user.name  "plan-a-monitor"
           git config user.email "actions@users.noreply.github.com"
-          git add -A seen_ids.json alerted.json run_history.json timeseries.json 2>/dev/null || true
+          git add -A seen_ids.json alerted.json run_history.json timeseries.json warned.json digest_state.json 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "no state changes"
           else

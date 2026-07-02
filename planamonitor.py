@@ -160,52 +160,75 @@ def fetch_reddit(terms: list[str], since: datetime, cfg: dict, limit: int = 100)
 # --------------------------------------------------------------------------
 # X / Twitter  (X API v2 recent search — needs a paid bearer token)
 # --------------------------------------------------------------------------
-def fetch_twitter(terms: list[str], since: datetime, cfg: dict) -> list[Mention]:
+def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
+                  watchlist: list[dict] | None = None) -> list[Mention]:
     token = cfg.get("bearer_token", "")
     if not token or token == "FILL IN":
         print("  [X] no bearer token configured; skipping X this run.")
         return []
     headers = {"Authorization": f"Bearer {token}"}
     max_results = int(cfg.get("max_results", 100))
-    # one combined OR query keeps us under the request cap
-    query = " OR ".join(f'"{t}"' for t in terms) + " -is:retweet lang:en"
-    params = urllib.parse.urlencode({
-        "query": query,
-        "max_results": min(max(max_results, 10), 100),
-        "tweet.fields": "created_at,public_metrics,author_id",
-        "expansions": "author_id",
-        "user.fields": "username,name,verified,public_metrics",
-        "start_time": since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    })
-    url = f"https://api.twitter.com/2/tweets/search/recent?{params}"
-    try:
-        data = _get_json(url, headers=headers)
-    except Exception as e:
-        _note_error(f"[X] fetch error: {e}")
-        return []
-    users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+    start_time = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Query 1: broad keyword search. Queries 2+: EVERYTHING the watchlist
+    # people tweet (chunked to stay under the query-length cap) — so a
+    # subtweet that never names the project is still caught. The short
+    # lookback window keeps this cheap under pay-per-use.
+    queries = [(" OR ".join(f'"{t}"' for t in terms) + " -is:retweet lang:en", False)]
+    handles = [h.lstrip("@") for w in (watchlist or []) for h in w.get("handles", [])]
+    chunk: list[str] = []
+    for h in handles:
+        if chunk and sum(len(x) + 9 for x in chunk) + len(h) + 9 > 480:
+            queries.append(("(" + " OR ".join(f"from:{x}" for x in chunk) + ") -is:retweet", True))
+            chunk = []
+        chunk.append(h)
+    if chunk:
+        queries.append(("(" + " OR ".join(f"from:{x}" for x in chunk) + ") -is:retweet", True))
+
     out: list[Mention] = []
-    for t in data.get("data", []):
-        u = users.get(t.get("author_id"), {})
-        pm = t.get("public_metrics", {})
-        upm = u.get("public_metrics", {})
-        handle = u.get("username", "")
-        out.append(Mention(
-            platform="twitter",
-            id=t["id"],
-            url=f"https://x.com/{handle}/status/{t['id']}" if handle else f"https://x.com/i/status/{t['id']}",
-            text=t.get("text", ""),
-            author=f"@{handle}" if handle else "",
-            author_name=u.get("name", ""),
-            author_followers=upm.get("followers_count"),
-            author_verified=bool(u.get("verified")),
-            created_at=datetime.strptime(t["created_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-                if t.get("created_at") else None,
-            engagement=int(pm.get("like_count", 0)) + 2 * int(pm.get("retweet_count", 0)) + int(pm.get("quote_count", 0)),
-            metrics={"likes": pm.get("like_count", 0), "reposts": pm.get("retweet_count", 0),
-                     "quotes": pm.get("quote_count", 0), "replies": pm.get("reply_count", 0),
-                     "impressions": pm.get("impression_count", 0)},
-        ))
+    got: set[str] = set()          # same tweet can match both query types
+    for query, is_watch in queries:
+        params = urllib.parse.urlencode({
+            "query": query,
+            "max_results": min(max(max_results, 10), 100),
+            "tweet.fields": "created_at,public_metrics,author_id",
+            "expansions": "author_id",
+            "user.fields": "username,name,verified,public_metrics",
+            "start_time": start_time,
+        })
+        url = f"https://api.twitter.com/2/tweets/search/recent?{params}"
+        try:
+            data = _get_json(url, headers=headers)
+        except Exception as e:
+            _note_error(f"[X] fetch error: {e}")
+            continue
+        users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+        for t in data.get("data", []):
+            if t["id"] in got:
+                continue
+            got.add(t["id"])
+            u = users.get(t.get("author_id"), {})
+            pm = t.get("public_metrics", {})
+            upm = u.get("public_metrics", {})
+            handle = u.get("username", "")
+            out.append(Mention(
+                platform="twitter",
+                id=t["id"],
+                url=f"https://x.com/{handle}/status/{t['id']}" if handle else f"https://x.com/i/status/{t['id']}",
+                text=t.get("text", ""),
+                author=f"@{handle}" if handle else "",
+                author_name=u.get("name", ""),
+                author_followers=upm.get("followers_count"),
+                author_verified=bool(u.get("verified")),
+                created_at=datetime.strptime(t["created_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                    if t.get("created_at") else None,
+                engagement=int(pm.get("like_count", 0)) + 2 * int(pm.get("retweet_count", 0)) + int(pm.get("quote_count", 0)),
+                metrics={"likes": pm.get("like_count", 0), "reposts": pm.get("retweet_count", 0),
+                         "quotes": pm.get("quote_count", 0), "replies": pm.get("reply_count", 0),
+                         "impressions": pm.get("impression_count", 0),
+                         "from_watchlist": is_watch},
+            ))
+        time.sleep(0.2)
     return out
 
 
@@ -229,7 +252,7 @@ def fetch_all(config: dict, since: datetime) -> list[Mention]:
         # X is pay-per-use, so keep the window small (little overlap with the
         # 5-min cron) to avoid re-reading — and re-paying for — the same tweets.
         tw_since = now - timedelta(minutes=config.get("twitter_lookback_minutes", 10))
-        mentions += fetch_twitter(terms, tw_since, src["twitter"])
+        mentions += fetch_twitter(terms, tw_since, src["twitter"], config.get("watchlist", []))
     if src.get("news", {}).get("enabled"):
         print("Fetching news…")
         mentions += fetch_news(terms, since, src["news"])
@@ -505,6 +528,12 @@ def prefilter(mentions, config):
 
     kept = []
     for m in mentions:
+        if m.metrics.get("from_watchlist"):
+            # Watchlist tweets skip the keyword gate — a subtweet never names
+            # the project. The AI classifier still vets whether it's about AIFP.
+            m.confidence = "medium"
+            kept.append(m)
+            continue
         text = m.text.lower()
         if any(t in text for t in high_terms):
             m.confidence = "high"
@@ -735,6 +764,21 @@ def _watch_hit(m, watchlist):
     return None
 
 
+def _watch_featured(m, watchlist):
+    """Watchlist person featured IN the content (full name in the title/text/
+    article excerpt) rather than authoring it. Only for article-ish platforms —
+    news 'authors' are outlets, so an Ezra Klein column or a piece quoting
+    Vance would otherwise never match the watchlist. X and Substack already
+    match by author."""
+    if m.platform not in ("news", "hackernews", "reddit"):
+        return None
+    text = (m.text + " " + m.metrics.get("article_excerpt", "")).lower()
+    for w in watchlist:
+        if re.search(r"\b" + re.escape(w["name"].lower()) + r"\b", text):
+            return w
+    return None
+
+
 # --------------------------------------------------------------------------
 # Per-post priority + tier
 # --------------------------------------------------------------------------
@@ -772,6 +816,14 @@ def score_mentions(mentions, config):
             tier = "critical" if w.get("weight") == "critical" else "high"
             score += 10000 if w.get("weight") == "critical" else 5000
             m.summary = f"[{w['name']}] " + (m.summary or m.text[:120])
+        else:
+            # …and an article/post that FEATURES a watchlist person is nearly
+            # as important as one they wrote.
+            fw = _watch_featured(m, watchlist)
+            if fw:
+                tier = "critical" if fw.get("weight") == "critical" else "high"
+                score += 5000 if fw.get("weight") == "critical" else 2500
+                m.summary = f"[features {fw['name']}] " + (m.summary or m.text[:120])
 
         # negative posts from anyone get a small bump (we care about these more)
         if m.sentiment == "negative":
@@ -889,6 +941,8 @@ _SEEN = "seen_ids.json"
 _HIST = "run_history.json"
 _ALERTED = "alerted.json"
 _TS = "timeseries.json"
+_WARNED = "warned.json"          # narrative-build cooldowns
+_DIGEST = "digest_state.json"    # last daily-digest date
 
 
 def _load(path, default):
@@ -915,18 +969,59 @@ def filter_new(mentions, state_dir="."):
     return fresh
 
 
-def baseline_and_record(current_total, state_dir="."):
-    """Return the rolling average of recent runs, then record this run."""
+def baseline_and_record(current_total, narrative_counts=None, state_dir="."):
+    """Return the rolling average of recent runs, then record this run
+    (including per-narrative counts, which feed the multi-day build detector)."""
     os.makedirs(state_dir, exist_ok=True)
     path = os.path.join(state_dir, _HIST)
     hist = _load(path, [])
     prev = [h["total"] for h in hist[-12:]]          # last ~12 runs
     avg = (sum(prev) / len(prev)) if prev else 0.0
-    hist.append({"ts": datetime.now(timezone.utc).isoformat(), "total": current_total})
-    hist = hist[-200:]
+    hist.append({"ts": datetime.now(timezone.utc).isoformat(), "total": current_total,
+                 "narratives": narrative_counts or {}})
+    hist = hist[-2000:]          # ≈1 week at the 5-min cadence
     with open(path, "w") as f:
-        json.dump(hist, f, indent=2)
+        json.dump(hist, f)
     return avg
+
+
+def narrative_build_hits(config, state_dir="."):
+    """Slow-burn detector: a narrative that accumulates mentions over DAYS even
+    though no single 5-min window ever crosses its per-run alert_count. Sums
+    the per-run counts recorded in run history over the last
+    narrative_build_days; a cooldown stops it re-warning every run."""
+    hist = _load(os.path.join(state_dir, _HIST), [])
+    now = datetime.now(timezone.utc)
+    default_days = int(config.get("narrative_build_days", 3))
+    cooldown = timedelta(hours=float(config.get("narrative_build_cooldown_hours", 12)))
+    warned = _load(os.path.join(state_dir, _WARNED), {})
+    hits = []
+    for nar in config.get("narratives", []):
+        label = nar["label"]
+        days = int(nar.get("build_days", default_days))
+        target = int(nar.get("build_count", 3 * int(nar.get("alert_count", 8))))
+        cutoff = now - timedelta(days=days)
+        total = 0
+        for h in hist:
+            try:
+                if datetime.fromisoformat(h["ts"]) >= cutoff:
+                    total += int(h.get("narratives", {}).get(label, 0))
+            except Exception:
+                continue
+        if total < target:
+            continue
+        last = warned.get(label)
+        try:
+            if last and now - datetime.fromisoformat(last) < cooldown:
+                continue
+        except Exception:
+            pass
+        warned[label] = now.isoformat()
+        hits.append({"label": label, "count": total, "days": days})
+    if hits:
+        with open(os.path.join(state_dir, _WARNED), "w") as f:
+            json.dump(warned, f)
+    return hits
 
 
 def record_timeseries(agg, new_mentions, state_dir="."):
@@ -1162,6 +1257,8 @@ def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
     for n in agg.get("narratives", []):
         if n.get("alert"):
             warn_reasons.append(f"narrative '{n['label']}' — {n['count']} mentions")
+    for b in narrative_build_hits(config, state_dir):
+        warn_reasons.append(f"narrative '{b['label']}' BUILDING — {b['count']} mentions over {b['days']} days")
     cluster_bar = int(config.get("cluster_alert_count", 6))
     for t in agg.get("themes", []):
         if t["count"] >= cluster_bar and t.get("mostly_small"):
@@ -1206,6 +1303,74 @@ def _chunk(text, size):
     if cur:
         yield "\n".join(cur)
 
+
+# --------------------------------------------------------------------------
+# Once-a-day summary (GENERAL tier: grey, no pings) built from the same
+# timeseries that feeds the dashboard.
+# --------------------------------------------------------------------------
+def build_daily_digest(config, state_dir="."):
+    ts = _load(os.path.join(state_dir, _TS), [])
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    pts = []
+    for p in ts:
+        try:
+            if datetime.fromisoformat(p["ts"]) >= cutoff:
+                pts.append(p)
+        except Exception:
+            continue
+    total = sum(p.get("total", 0) for p in pts)
+    pos = sum(p.get("positive", 0) for p in pts)
+    neg = sum(p.get("negative", 0) for p in pts)
+    neu = sum(p.get("neutral", 0) for p in pts)
+    plat, themes = Counter(), Counter()
+    notable = []
+    for p in pts:
+        for k, v in (p.get("by_platform") or {}).items():
+            plat[k] += v
+        for t in p.get("themes", []):
+            themes[t["theme"]] += t["count"]
+        notable += p.get("notable", [])
+    lines = [f"*{total} mentions in the last 24h*"
+             + (f"  ({', '.join(f'{k}: {v}' for k, v in plat.most_common())})" if plat else ""),
+             f"Sentiment — 🟢 {pos} · ⚪ {neu} · 🔴 {neg}"]
+    if themes:
+        lines.append("Themes: " + ", ".join(f"{k} ({v})" for k, v in themes.most_common(5)))
+    for n in notable[-6:]:
+        lines.append(f"• {_EMOJI.get(n.get('sentiment'), '⚪')} {n.get('author', '')} — "
+                     f"<{n.get('url', '')}|{(n.get('summary') or '')[:90]}>")
+    if total == 0:
+        lines.append("_Quiet day — no relevant mentions recorded._")
+    title = config.get("slack", {}).get("digest_title", "Plan A monitor")
+    return {"text": f"⚪ *{title} — daily summary, {now.strftime('%b %-d')}*",
+            "attachments": [{"color": "#B0B0B0", "text": "\n".join(lines),
+                             "mrkdwn_in": ["text"], "fallback": "daily summary"}]}
+
+
+def maybe_daily_digest(config, wh, live, state_dir="."):
+    """Post the daily digest on the first run after the configured hour."""
+    dd = config.get("daily_digest", {})
+    if not dd.get("enabled"):
+        return
+    now = datetime.now(timezone.utc)
+    if now.hour < int(dd.get("hour_utc", 23)):
+        return
+    path = os.path.join(state_dir, _DIGEST)
+    state = _load(path, {})
+    today = now.strftime("%Y-%m-%d")
+    if state.get("last_sent") == today:
+        return
+    payload = build_daily_digest(config, state_dir)
+    if live:
+        post_slack_payload(wh, payload)
+        print("Posted daily digest.")
+    else:
+        print("\n" + "-"*70 + "\nDAILY DIGEST (dry run)\n" + "-"*70 + "\n"
+              + payload["text"] + "\n" + payload["attachments"][0]["text"])
+    state["last_sent"] = today
+    with open(path, "w") as f:
+        json.dump(state, f)
+
 # ===== main =====
 def _env_overlay(c):
     s=c.setdefault("slack",{})
@@ -1235,7 +1400,9 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     mentions = classify(mentions, config); print(f"{len(mentions)} judged relevant.")
     new = filter_new(mentions, state_dir); print(f"{len(new)} new since last run.")
     score_mentions(new, config); agg = aggregate(new, config)
-    baseline = baseline_and_record(agg["total"], state_dir)
+    baseline = baseline_and_record(agg["total"],
+                                   {n["label"]: n["count"] for n in agg["narratives"]},
+                                   state_dir)
     spike, ratio = detect_spike(agg["total"], baseline, config.get("spike_factor", 3.0))
     record_timeseries(agg, new, state_dir)
     title = config.get("slack", {}).get("digest_title", "Plan A monitor")
@@ -1257,6 +1424,13 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
                 print(f"  [health] could not post error ping: {e}")
         else:
             print("\n" + "-"*70 + "\nHEALTH (dry run)\n" + "-"*70 + "\n" + ping)
+
+    # Once-a-day quiet summary (no pings) — fires on the first run after the
+    # configured hour, driven by the same 5-min cron.
+    try:
+        maybe_daily_digest(config, wh, live, state_dir)
+    except Exception as e:
+        print(f"  [digest] daily digest failed: {e}")
 
     if mode == "digest":
         message = build_digest(new, agg, spike, ratio, baseline, title)
