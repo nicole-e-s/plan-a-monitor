@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# PRIVATE — the watchlist must never enter the public repo
+watchlist.local.yaml
+Media Monitoring Handoff Doc.md

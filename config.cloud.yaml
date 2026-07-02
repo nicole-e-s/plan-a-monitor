@@ -1,0 +1,233 @@
+search_terms:
+- query: AI 2040
+  precision: high
+- query: AI Futures Project
+  precision: high
+- query: Daniel Kokotajlo
+  precision: high
+- query: ai-2040.com
+  precision: high
+- query: Plan A
+  precision: low
+- query: AI 2027
+  precision: low
+context_terms:
+- AI Futures
+- Kokotajlo
+- Lifland
+- AI 2027
+- AI 2040
+- ai-2027.com
+- ai-2040.com
+- superintelligence
+- intelligence explosion
+- slowdown
+- takeoff
+- scenario
+# The watchlist (people, handles, weights) and substack_feeds (their blog
+# feeds) are INTENTIONALLY NOT in this public file. They live in the GitHub
+# Actions secret WATCHLIST_YAML (Settings -> Secrets and variables -> Actions).
+# Structure of the secret:
+#   watchlist:
+#   - name: Person Name
+#     handles: ['@handle']
+#     weight: critical | high
+#   substack_feeds:
+#     Person Name: https://their.blog/feed
+# For local testing, put the same YAML in watchlist.local.yaml (gitignored).
+watchlist: []
+narratives:
+- label: timelines-wrong
+  keywords:
+  - predictions wrong
+  - didn't happen
+  - didn't come true
+  - already wrong
+  - hasn't happened
+  - debunked
+  - aged poorly
+  - doomer
+  - fearmonger
+  - grift
+  - cult
+  - wrong again
+  - 2027 didn't
+  alert_count: 8
+- label: too-close-to-labs
+  keywords:
+  - captured
+  - shill
+  - lab propaganda
+  - regulatory capture
+  - industry
+  alert_count: 6
+- label: unrealistic-plan
+  keywords:
+  - unrealistic
+  - naive
+  - never happen
+  - fantasy
+  - utopian
+  - won't work
+  alert_count: 8
+- label: unscientific
+  keywords:
+  - unscientific
+  - too many assumptions
+  - not rigorous
+  - pseudoscience
+  - straight line
+  - no evidence
+  - made up
+  - just a story
+  - sci-fi
+  - science fiction
+  alert_count: 8
+- label: ignores-china
+  keywords:
+  - not taking china
+  - ignores china
+  - naive about china
+  - china won't
+  alert_count: 6
+- label: sensational-name
+  keywords:
+  - sensational
+  - clickbait
+  - fearmongering name
+  - overstated
+  - false urgency
+  alert_count: 6
+- label: doomer
+  keywords:
+  - doomer
+  - doomerism
+  - alarmist
+  - fear porn
+  - panic
+  alert_count: 8
+- label: overexposed
+  keywords:
+  - too many podcasts
+  - everywhere
+  - in my face
+  - shut up about
+  - overexposed
+  alert_count: 6
+thresholds:
+  twitter:
+    likes: 25
+    reposts: 8
+    author_followers: 20000
+    # A single tweet clearing this many impressions is "worth addressing" on
+    # its own, even from a non-watchlist account. Starting guess — calibrate on
+    # live traffic. (Edit this number in the GitHub web UI to tune sensitivity.)
+    impressions: 10000
+  reddit:
+    score: 15
+    num_comments: 10
+  hackernews:
+    points: 20
+    num_comments: 15
+spike_factor: 3.0
+cluster_alert_count: 6
+neg_surge_count: 5
+escalate_factor: 4.0
+# --- slow-building narrative detection ---
+# Besides the per-window alert_count above, a narrative also WARNs when its
+# TOTAL mentions over the last narrative_build_days reach 3x its alert_count
+# (override per narrative with build_count). Catches a drip of criticism that
+# never spikes in any single 5-minute window.
+narrative_build_days: 3
+narrative_build_cooldown_hours: 12   # don't re-warn about the same build more often than this
+# --- once-a-day summary post (grey, no pings) ---
+daily_digest:
+  enabled: true
+  hour_utc: 23   # 23:00 UTC = 4 PM PDT (daylight time; set to 0 for 4 PM PST in winter)
+sources:
+  hackernews:
+    enabled: true
+  reddit:
+    enabled: false
+    client_id: FILL IN
+    client_secret: FILL IN
+    user_agent: plan-a-monitor by u/yourusername
+  reddit_rss:
+    # Public Reddit search RSS — needs NO app/credentials (the official API is
+    # now approval-gated). May get IP-blocked when run from GitHub Actions; if
+    # so, the run log shows "[Reddit-RSS] error" and we fall back to no Reddit.
+    enabled: true
+  twitter:
+    enabled: false
+    bearer_token: FILL IN
+    max_results: 100
+  news:
+    enabled: true
+    min_tier: 2
+    pickup_threshold: 5
+    tier1_outlets:
+    - New York Times
+    - Washington Post
+    - Wall Street Journal
+    - Bloomberg
+    - Financial Times
+    - The Economist
+    - Reuters
+    - Associated Press
+    - The Atlantic
+    - The New Yorker
+    - Politico
+    - Axios
+    - NPR
+    - TIME
+    - The Guardian
+    - BBC
+    - CNN
+    - CNBC
+    - Vox
+    - WIRED
+    - MIT Technology Review
+    - The Verge
+    - Forbes
+    - The Information
+    tier2_outlets:
+    - TechCrunch
+    - Ars Technica
+    - VentureBeat
+    - Semafor
+    - The Hill
+    - Business Insider
+    - Fortune
+    - The Times
+    - Fox News
+    - Slate
+    - The Verge
+llm:
+  enabled: true
+  provider: anthropic
+  api_key: ''
+  # Cheap/fast model for the bulk relevance + sentiment pass:
+  model: claude-haiku-4-5-20251001
+  # Higher-fidelity model used ONLY to re-judge high-stakes items (negative /
+  # mixed sentiment or substantive critiques) — the posts that drive CRITICAL /
+  # WARNING alerts. Leave blank ('') to turn the second pass off.
+  escalate_model: claude-sonnet-5
+  batch_size: 15
+mode: alerts
+slack:
+  webhook_url: ''
+  digest_title: "Plan A \u2014 public response monitor"
+  # Slack member IDs are private and come from GitHub Actions secrets:
+  #   SLACK_ERROR_NOTIFY   — one member ID, pinged when the monitor errors out
+  #                          or silently degrades (health alerts)
+  #   SLACK_RESPOND_NOTIFY — comma-separated member IDs, pinged for WARNING
+  #                          alerts + influential positive/neutral posts
+  error_notify: ''
+  respond_notify: []
+lookback_hours: 1
+# Per-source lookback overrides:
+twitter_lookback_minutes: 10      # keep X reads cheap (pay-per-use): small overlap with the 5-min cron
+reddit_rss_lookback_hours: 6
+substack_lookback_hours: 24       # blog posts are infrequent; dedupe stops re-alerts
+# substack_feeds (one blog/newsletter feed per watchlist person) also comes
+# from the WATCHLIST_YAML secret — see the watchlist note above.
