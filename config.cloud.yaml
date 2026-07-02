@@ -114,18 +114,17 @@ narratives:
   - shut up about
   - overexposed
   alert_count: 6
-# When does a SINGLE post deserve its own alert? (Small posts still count
-# toward the dashboard + surge/narrative detection no matter what.) Edit these
-# numbers right here in the GitHub web UI to tune alert sensitivity — higher
-# numbers = fewer pings. Retuned 2026-07-02 after launch-day over-pinging.
+# When does a SINGLE post deserve its own alert? A post pings if it clears
+# ANY ONE of these bars. (Small posts still count toward the dashboard +
+# surge/narrative detection no matter what — these numbers only gate pings.)
+# Edit the numbers right here in the GitHub web UI to tune sensitivity:
+# higher numbers = fewer pings. Set per comms 2026-07-02.
 thresholds:
   twitter:
-    likes: 50
-    reposts: 20
-    author_followers: 100000   # a "key figure"-sized account
-    # The primary "worth addressing" bar — a tweet this visible merits a look
-    # even from an unknown account. (~10k impressions ≈ 50-100 interactions.)
-    impressions: 10000
+    likes: 500
+    reposts: 50
+    author_followers: 150000   # a "key figure"-sized account
+    impressions: 100000        # views — the primary "worth addressing" bar
   reddit:
     score: 15
     num_comments: 10

@@ -1,6 +1,6 @@
 # Plan A Monitor — Design Doc
 
-*Owned by the AIFP comms/monitoring operator · Updated: 2026-07-02 · Status: live (launched July 2, 2026)*
+*Owned by the AIFP comms/monitoring operator · Updated: 2026-07-02 · Status: monitor live; publication launch expected within days*
 
 ## 1. Purpose
 
@@ -89,7 +89,7 @@ Coverage per person is threefold: their **X accounts are polled directly** (`fro
 
 ## 8. Thresholds & tuning
 
-- **"Worth a ping" bar (non-watchlist):** ~**10,000 impressions**, or engagement equivalent (~50–100 interactions) as a fallback since `impression_count` can read 0. Starting number, **calibrated on live traffic**.
+- **"Worth a ping" bar (non-watchlist):** a post alerts if it clears **any one** of: **≥100k impressions (views)**, **≥500 likes**, **≥50 reposts**, or an author with **≥150k followers**. (Multiple bars because `impression_count` can read 0/lag on some posts.) Set by comms 2026-07-02; tunable anytime in the config.
 - **Watchlist people bypass the bar.**
 - **The bar gates *alerts*, never *counting*** — every relevant post still flows to the dashboard/sentiment/surge/narrative logic, so a swarm of small negatives still trips a WARNING. This is why the exact number is low-stakes.
 - **Substantive critiques** get a discounted bar (≥ ~10 interactions or a very large author) rather than a free pass — a zero-engagement hot take no longer pings on the "critique" label alone.
