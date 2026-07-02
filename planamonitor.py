@@ -1438,7 +1438,25 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     _ERRORS.clear()
     if not config.get("watchlist"):
         _note_error("watchlist is EMPTY — WATCHLIST_YAML secret missing/unset? Watchlist alerts are OFF.")
-    since = datetime.now(timezone.utc) - timedelta(hours=config.get("lookback_hours", 6))
+    now = datetime.now(timezone.utc)
+    # GitHub's cron is best-effort: gaps of 2-3 HOURS between scheduled runs
+    # have been observed. If the last run was longer ago than the configured
+    # windows, stretch them to cover the gap (dedup makes overlap harmless) —
+    # otherwise the short X window would silently skip everything in between.
+    gap_min = 0.0
+    hist = _load(os.path.join(state_dir, _HIST), [])
+    if hist:
+        try:
+            gap_min = (now - datetime.fromisoformat(hist[-1]["ts"])).total_seconds() / 60
+        except Exception:
+            pass
+    pad_min = gap_min + 10                      # gap plus a safety overlap
+    lb_hours = min(max(config.get("lookback_hours", 6), pad_min / 60), 12)
+    config["twitter_lookback_minutes"] = min(
+        max(config.get("twitter_lookback_minutes", 10), pad_min), 12 * 60)
+    if gap_min > 30:
+        print(f"  [cron] {gap_min:.0f} min since last run — widening fetch windows to cover the gap.")
+    since = now - timedelta(hours=lb_hours)
     if mentions is None: mentions = fetch_all(config, since)
     print(f"Fetched {len(mentions)} raw mentions.")
     _llm = config.get("llm", {})
