@@ -31,11 +31,11 @@ It exists to solve the **"AI 2027 problem"**: last time, negative discourse ("th
 
 | Source | Role | Status |
 |---|---|---|
-| **X/Twitter (API Pro)** | Primary. Broad keyword search **+** per-watchlist `from:` queries. | Pro approved; **TODO** pick owning account → add `X_BEARER_TOKEN` |
+| **X/Twitter (API, pay-per-use)** | Primary. Broad keyword search **+** per-watchlist `from:` queries. | App `aifp_scraper` created; **TODO** buy credits + set spend limit → add `X_BEARER_TOKEN`. X ended new Basic/Pro signups — it's ~$0.005/read now. |
 | **Substack / blogs (RSS)** | Longform reactions from watchlist people | Feeds mapped (§6); **TODO** build the RSS fetcher |
 | **Hacker News (Algolia)** | Article discussion + comment sentiment | ✅ live |
 | **Google News (RSS)** | Detects article pickup / syndication | ✅ live (English/US) |
-| **Reddit** | Community reaction | Code wired; **TODO** create "script" app → add creds |
+| **Reddit** | Community reaction | Code wired, but Reddit **disabled self-serve API app creation** (2026) — now needs a developer access-request + approval (uncertain, high rejection). **Deprioritized for launch.** |
 | **Non-English news** | Foreign-language coverage | Post-launch |
 
 ## 5. Pipeline
@@ -109,7 +109,7 @@ Static GitHub Pages reading `timeseries.json`: volume + sentiment over time + re
 ## 11. Models & cost
 
 - **Tiered:** Haiku 4.5 (bulk) + Sonnet 5 (escalation). *(Implemented; fixed a previously-invalid model id that had been silently degrading the tool to keyword-only.)*
-- **Cost:** AI spend is a rounding error next to the X API Pro subscription — optimize for **fidelity**, not pennies.
+- **Cost:** AI spend is a rounding error next to X API usage (pay-per-use, ~$0.005/read) — optimize for **fidelity**, not pennies.
 
 ## 12. Operations
 
