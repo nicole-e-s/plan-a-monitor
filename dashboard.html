@@ -48,10 +48,22 @@
 <script>
 const DOT={positive:'var(--pos)',negative:'var(--neg)',neutral:'var(--neu)',mixed:'var(--neu)',unknown:'var(--neu)'};
 let chart;
+// Read the data straight from the repo (raw.githubusercontent.com) rather than
+// from GitHub Pages: our 5-minute state commits exceed Pages' ~10 builds/hour
+// throttle, so the Pages copy of timeseries.json can lag 20-30 minutes behind.
+// The raw URL serves the latest commit directly. Local file kept as fallback.
+const RAW='https://raw.githubusercontent.com/nicole-e-s/plan-a-monitor/main/timeseries.json';
 async function load(){
   let data=[];
-  try{ const r=await fetch('timeseries.json?_='+Date.now()); data=await r.json(); }
-  catch(e){ document.getElementById('status').textContent='no data yet (timeseries.json not found)'; return; }
+  try{
+    let r=await fetch(RAW+'?_='+Date.now(),{cache:'no-store'});
+    if(!r.ok) r=await fetch('timeseries.json?_='+Date.now());
+    data=await r.json();
+  }
+  catch(e){
+    try{ const r=await fetch('timeseries.json?_='+Date.now()); data=await r.json(); }
+    catch(e2){ document.getElementById('status').textContent='no data yet (timeseries.json not found)'; return; }
+  }
   if(!Array.isArray(data)||!data.length){ document.getElementById('status').textContent='waiting for first data point…'; return; }
 
   const now=Date.now(), DAY=864e5;
