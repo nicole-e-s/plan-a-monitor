@@ -174,7 +174,10 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
     # people tweet (chunked to stay under the query-length cap) — so a
     # subtweet that never names the project is still caught. The short
     # lookback window keeps this cheap under pay-per-use.
-    queries = [(" OR ".join(f'"{t}"' for t in terms) + " -is:retweet lang:en", False)]
+    # NOTE: the parentheses matter — X binds AND (space) tighter than OR, so
+    # without them "-is:retweet" applies ONLY to the last term and retweet
+    # swarms flood in (each carrying the ORIGINAL tweet's repost count).
+    queries = [("(" + " OR ".join(f'"{t}"' for t in terms) + ") -is:retweet lang:en", False)]
     handles = [h.lstrip("@") for w in (watchlist or []) for h in w.get("handles", [])]
     chunk: list[str] = []
     for h in handles:
@@ -636,7 +639,9 @@ def _anthropic_call(api_key, model, prompt):
                  "content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:
         data = json.load(r)
-    return data["content"][0]["text"]
+    # concatenate the text blocks — content[0] isn't guaranteed to be text
+    # (e.g. a thinking block comes first on some models)
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
 
 def _openai_call(api_key, model, prompt):
@@ -693,7 +698,7 @@ def ai_classify(mentions, llm_cfg):
                 if body:
                     m.metrics["article_excerpt"] = body[:1200]
 
-    def _label(items, use_model):
+    def _label(items, use_model, fallback=True):
         """Classify a list of mentions in batches with the given model."""
         for start in range(0, len(items), batch):
             chunk = items[start:start + batch]
@@ -706,9 +711,15 @@ def ai_classify(mentions, llm_cfg):
                 raw = (_anthropic_call if provider == "anthropic" else _openai_call)(api_key, use_model, prompt)
                 results = {r["i"]: r for r in _extract_json(raw)}
             except Exception as e:
-                _note_error(f"[AI] batch failed on model '{use_model}' ({e}); "
-                            f"keyword fallback for {len(chunk)} item(s).")
-                keyword_fallback(chunk)
+                if fallback:
+                    _note_error(f"[AI] batch failed on model '{use_model}' ({e}); "
+                                f"keyword fallback for {len(chunk)} item(s).")
+                    keyword_fallback(chunk)
+                else:
+                    # escalation pass: on failure KEEP the first-pass labels —
+                    # never downgrade an already-classified item to keywords
+                    _note_error(f"[AI] escalation failed on '{use_model}' ({e}); "
+                                f"keeping first-pass labels for {len(chunk)} item(s).")
                 continue
             for i, m in enumerate(chunk):
                 r = results.get(i)
@@ -732,7 +743,7 @@ def ai_classify(mentions, llm_cfg):
                     (m.sentiment in ("negative", "mixed") or m.stance == "substantive_critique")]
         if escalate:
             print(f"  [AI] escalating {len(escalate)} item(s) to {escalate_model}.")
-            _label(escalate, escalate_model)
+            _label(escalate, escalate_model, fallback=False)
     return mentions
 
 
@@ -808,8 +819,12 @@ def score_mentions(mentions, config):
             # already passed the big-outlet / syndication bar in news.py
             tier = "critical" if p.get("tier") == 1 else "high"
 
-        # substantive critique always worth a look even if small
-        if m.stance == "substantive_critique" and tier == "low":
+        # substantive critique worth a look even if smallish — but it must have
+        # SOME traction (a dozen interactions, or a genuinely big author), or
+        # every zero-engagement hot take pings the team. Small critiques still
+        # count toward surges/narratives/dashboard regardless.
+        if m.stance == "substantive_critique" and tier == "low" and (
+                m.engagement >= 10 or (m.author_followers or 0) >= 100000):
             tier = "high"
 
         # watchlist authors override everything

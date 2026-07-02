@@ -7,8 +7,8 @@ search_terms:
   precision: high
 - query: ai-2040.com
   precision: high
-- query: Plan A
-  precision: low
+# ("Plan A" was removed 2026-07-02 — far too many false positives: "plan a
+#  trip", "plan a variety show", etc. "AI 2040"/"ai-2040.com" cover the title.)
 - query: AI 2027
   precision: low
 context_terms:
@@ -114,14 +114,17 @@ narratives:
   - shut up about
   - overexposed
   alert_count: 6
+# When does a SINGLE post deserve its own alert? (Small posts still count
+# toward the dashboard + surge/narrative detection no matter what.) Edit these
+# numbers right here in the GitHub web UI to tune alert sensitivity — higher
+# numbers = fewer pings. Retuned 2026-07-02 after launch-day over-pinging.
 thresholds:
   twitter:
-    likes: 25
-    reposts: 8
-    author_followers: 20000
-    # A single tweet clearing this many impressions is "worth addressing" on
-    # its own, even from a non-watchlist account. Starting guess — calibrate on
-    # live traffic. (Edit this number in the GitHub web UI to tune sensitivity.)
+    likes: 50
+    reposts: 20
+    author_followers: 100000   # a "key figure"-sized account
+    # The primary "worth addressing" bar — a tweet this visible merits a look
+    # even from an unknown account. (~10k impressions ≈ 50-100 interactions.)
     impressions: 10000
   reddit:
     score: 15

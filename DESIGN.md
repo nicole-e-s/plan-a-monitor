@@ -1,6 +1,6 @@
 # Plan A Monitor — Design Doc
 
-*Owner: Dillon Nguyen · Updated: 2026-07-01 · Status: pre-launch (launch ~July 2, 2026)*
+*Owned by the AIFP comms/monitoring operator · Updated: 2026-07-02 · Status: live (launched July 2, 2026)*
 
 ## 1. Purpose
 
@@ -69,13 +69,13 @@ Coverage per person is threefold: their **X accounts are polled directly** (`fro
 
 ## 7. Alert tiers & Slack routing
 
-**Governing rule:** *ping Lauren + Nicole whenever we should **respond**; ping `@channel` when we must **devise a response to something negative**.* Sidebar color encodes the cell for skimming.
+**Governing rule:** *ping the comms responders whenever we should **respond**; ping `@channel` when we must **devise a response to something negative**.* Sidebar color encodes the cell for skimming. (Responder identities/IDs live in the `SLACK_RESPOND_NOTIFY` secret + the private copy of this doc.)
 
 | Who posted | Negative | Neutral | Positive |
 |---|---|---|---|
-| Watchlist person | 🔴 CRITICAL · `@channel` · red | ⚪ ping Lauren+Nicole · white | 🟢 ping Lauren+Nicole · green |
-| Big-attention non-watchlist | 🔴 CRITICAL · `@channel` · red | ⚪ ping Lauren+Nicole · white | 🟢 ping Lauren+Nicole · green |
-| General crowd (aggregate) | 🟠 WARNING · ping Lauren+Nicole · orange | ▫️ plaintext · grey | 🟩 plaintext · light-green |
+| Watchlist person | 🔴 CRITICAL · `@channel` · red | ⚪ ping responders · white | 🟢 ping responders · green |
+| Big-attention non-watchlist | 🔴 CRITICAL · `@channel` · red | ⚪ ping responders · white | 🟢 ping responders · green |
+| General crowd (aggregate) | 🟠 WARNING · ping responders · orange | ▫️ plaintext · grey | 🟩 plaintext · light-green |
 | Daily summary | — | ▫️ plaintext · grey · once/day | — |
 
 **Mechanics:**
@@ -92,6 +92,7 @@ Coverage per person is threefold: their **X accounts are polled directly** (`fro
 - **"Worth a ping" bar (non-watchlist):** ~**10,000 impressions**, or engagement equivalent (~50–100 interactions) as a fallback since `impression_count` can read 0. Starting number, **calibrated on live traffic**.
 - **Watchlist people bypass the bar.**
 - **The bar gates *alerts*, never *counting*** — every relevant post still flows to the dashboard/sentiment/surge/narrative logic, so a swarm of small negatives still trips a WARNING. This is why the exact number is low-stakes.
+- **Substantive critiques** get a discounted bar (≥ ~10 interactions or a very large author) rather than a free pass — a zero-engagement hot take no longer pings on the "critique" label alone.
 - **No auto-modulation** (fixed number). **Controlled via GitHub's browser editor** on a heavily-commented config, so a non-technical comms person can adjust it without a terminal.
 
 ## 9. Health / self-monitoring
@@ -109,7 +110,7 @@ Static GitHub Pages reading `timeseries.json`: volume + sentiment over time + re
 
 ## 12. Operations
 
-- **Repo:** runs from the handler's repo (`nicole-e-s/plan-a-monitor`); Dillon has push access.
+- **Repo:** runs from `nicole-e-s/plan-a-monitor`; the operator has push access.
 - **Schedule:** GitHub Actions cron, **every 5 min**; state committed back each run.
 - **Secrets** (GitHub → Settings → Secrets and variables → Actions — *never in code/YAML*): `SLACK_WEBHOOK_URL` ✅, `ANTHROPIC_API_KEY` ✅, `X_BEARER_TOKEN` ✅ ($500 credits, $1,000/mo cap), `WATCHLIST_YAML` (the private watchlist + feeds — the monitor health-pings the operator if it's missing), `SLACK_ERROR_NOTIFY` + `SLACK_RESPOND_NOTIFY` (private staff member IDs for pings), `REDDIT_CLIENT_ID`/`SECRET` pending Reddit's application review (RSS coverage needs none). X/Reddit auto-enable when their secrets exist.
 - **Cron reliability:** GitHub cron is best-effort (can lag/skip). The design is resilient — the 1-hour lookback + dedupe means a skipped run is recovered on the next one (latency, not data loss). Launch day: keep the manual "Run workflow" button (or an external trigger) as backup.
