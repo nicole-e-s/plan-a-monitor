@@ -143,6 +143,9 @@ thresholds:
     points: 20
     num_comments: 15
 spike_factor: 3.0
+# A volume spike needs at least this many mentions in one run before it can
+# warn — stops "24x normal" false alarms when normal is close to zero.
+spike_min_mentions: 10
 cluster_alert_count: 6
 neg_surge_count: 5
 escalate_factor: 4.0

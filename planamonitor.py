@@ -258,7 +258,11 @@ def fetch_all(config: dict, since: datetime) -> list[Mention]:
         mentions += fetch_twitter(terms, tw_since, src["twitter"], config.get("watchlist", []))
     if src.get("news", {}).get("enabled"):
         print("Fetching news…")
-        mentions += fetch_news(terms, since, src["news"])
+        # window may be stretched by run() to cover a Google News outage
+        news_since = since
+        if config.get("news_lookback_hours"):
+            news_since = min(since, now - timedelta(hours=config["news_lookback_hours"]))
+        mentions += fetch_news(terms, news_since, src["news"])
     if config.get("substack_feeds"):
         print("Fetching Substack/blogs…")
         sub_since = now - timedelta(hours=config.get("substack_lookback_hours", 24))
@@ -345,11 +349,19 @@ def fetch_news(terms, since, cfg) -> list[Mention]:
 
     # 1) gather raw articles — ONE combined OR query, not one request per term:
     # Google News 503-throttles datacenter IPs when hit 8x every 5 minutes.
-    raw = []
-    try:
-        raw = _fetch_rss(" OR ".join(f'"{t}"' for t in terms), limit=100)
-    except Exception as e:
-        _note_error(f"[News] fetch error: {e}")
+    # Retries with backoff because it still 503s intermittently even at 1/run.
+    raw, last_err = [], None
+    query = " OR ".join(f'"{t}"' for t in terms)
+    for attempt in range(3):
+        try:
+            raw = _fetch_rss(query, limit=100)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(5 * (attempt + 1))
+    if last_err:
+        _note_error(f"[News] fetch error after 3 tries: {last_err}")
     # de-dupe identical links, keep within time window
     seen_links, articles = set(), []
     for a in raw:
@@ -901,10 +913,14 @@ def aggregate(mentions, config):
     }
 
 
-def detect_spike(current_total, baseline_avg, factor):
-    if baseline_avg <= 0:
+def detect_spike(current_total, baseline_avg, factor, min_mentions=10):
+    """A spike needs real volume, not just a big ratio: in quiet periods the
+    baseline sits near zero, and 2 mentions against a 0.08 average is '24x
+    normal' — mathematically true, editorially garbage. The baseline is also
+    floored at 1 so the ratio can't explode."""
+    if current_total < min_mentions:
         return False, 0.0
-    ratio = current_total / baseline_avg
+    ratio = current_total / max(baseline_avg, 1.0)
     return ratio >= factor, round(ratio, 1)
 
 
@@ -1130,7 +1146,9 @@ def _item_line(m):
     a discussion thread."""
     who = m.author or m.author_name or "unknown"
     date = _datestr(m)
-    head = (f"{_TIER.get(m.tier,'⚪')} {_EMOJI.get(m.sentiment,'⚪')} *{m.platform}* · {who} · "
+    # ONE dot per item (sentiment) — the message's own tier/color says how
+    # urgent it is; a second dot per line read as confusing noise in Slack.
+    head = (f"{_EMOJI.get(m.sentiment,'⚪')} *{m.platform}* · {who} · "
             f"{_engagement_str(m)}" + (f" · {date}" if date else ""))
     body = f"   {m.summary or m.text[:150]}"
     art = m.metrics.get("article_url")
@@ -1285,7 +1303,7 @@ def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
         if t["count"] >= cluster_bar and t.get("mostly_small"):
             warn_reasons.append(f"pattern '{t['theme']}' — {t['count']} small posts, {t['neg_pct']}% neg")
     if spike:
-        warn_reasons.append(f"volume spike {ratio}× normal")
+        warn_reasons.append(f"volume spike — {agg['total']} mentions, ≈{ratio}× the recent average")
 
     payloads = []
     for tier_key in _TIER_ORDER:
@@ -1455,6 +1473,17 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
             pass
     pad_min = gap_min + 10                      # gap plus a safety overlap
     lb_hours = min(max(config.get("lookback_hours", 6), pad_min / 60), 12)
+    # News gets its own stretch: if Google News has been 503ing (see
+    # health_state), widen the window back to the last successful fetch so
+    # articles published during the outage aren't missed once it recovers.
+    hstate = _load(os.path.join(state_dir, _HEALTH), {})
+    try:
+        news_gap_h = (now - datetime.fromisoformat(hstate["news_last_ok"])).total_seconds() / 3600
+        config["news_lookback_hours"] = min(max(lb_hours, news_gap_h + 0.25), 24)
+        if news_gap_h > 1:
+            print(f"  [news] last successful fetch {news_gap_h:.1f}h ago — widening news window.")
+    except Exception:
+        config["news_lookback_hours"] = lb_hours
     config["twitter_lookback_minutes"] = min(
         max(config.get("twitter_lookback_minutes", 10), pad_min), 12 * 60)
     if gap_min > 30:
@@ -1462,6 +1491,13 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     since = now - timedelta(hours=lb_hours)
     if mentions is None: mentions = fetch_all(config, since)
     print(f"Fetched {len(mentions)} raw mentions.")
+    # record the last time Google News answered, for the outage-stretch above
+    if config.get("sources", {}).get("news", {}).get("enabled") and \
+       not any(e.startswith("[News]") for e in _ERRORS):
+        hs = _load(os.path.join(state_dir, _HEALTH), {})
+        hs["news_last_ok"] = now.isoformat()
+        with open(os.path.join(state_dir, _HEALTH), "w") as f:
+            json.dump(hs, f)
     _llm = config.get("llm", {})
     if _llm.get("enabled") and _llm.get("api_key", "") in ("", "FILL IN"):
         _note_error("ANTHROPIC_API_KEY not set — running keyword-only classification (low fidelity).")
@@ -1471,7 +1507,8 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     baseline = baseline_and_record(agg["total"],
                                    {n["label"]: n["count"] for n in agg["narratives"]},
                                    state_dir)
-    spike, ratio = detect_spike(agg["total"], baseline, config.get("spike_factor", 3.0))
+    spike, ratio = detect_spike(agg["total"], baseline, config.get("spike_factor", 3.0),
+                                int(config.get("spike_min_mentions", 10)))
     record_timeseries(agg, new, state_dir)
     title = config.get("slack", {}).get("digest_title", "Plan A monitor")
     mode = config.get("mode", "alerts")
@@ -1508,8 +1545,12 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
                     print(f"  [health] could not post error ping: {e}")
             else:
                 print("\n" + "-"*70 + "\nHEALTH (dry run)\n" + "-"*70 + "\n" + ping)
+            # load BEFORE opening for write (this file also carries
+            # news_last_ok, and "w" truncates before a same-line load runs)
+            merged = dict(_load(hpath, {}), sig=sig,
+                          ts=datetime.now(timezone.utc).isoformat())
             with open(hpath, "w") as f:
-                json.dump({"sig": sig, "ts": datetime.now(timezone.utc).isoformat()}, f)
+                json.dump(merged, f)
 
     # Once-a-day quiet summary (no pings) — fires on the first run after the
     # configured hour, driven by the same 5-min cron.
