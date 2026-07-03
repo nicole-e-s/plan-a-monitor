@@ -9,10 +9,11 @@ on:
     - cron: "2-57/5 * * * *"
   workflow_dispatch:
     inputs:
-      selftest:
-        description: "Post labeled sample alerts to Slack (tests pings/colors/sources); no state changes"
-        type: boolean
-        default: false
+      mode:
+        description: "normal = regular run · selftest = sample alerts, no state changes · stresstest = synthetic burst through the full pipeline, pings operator only · stresstest-clean = remove the burst"
+        type: choice
+        default: normal
+        options: [normal, selftest, stresstest, stresstest-clean]
 
 concurrency:
   group: plan-a-monitor
@@ -40,7 +41,7 @@ jobs:
           WATCHLIST_YAML: ${{ secrets.WATCHLIST_YAML }}
           SLACK_ERROR_NOTIFY: ${{ secrets.SLACK_ERROR_NOTIFY }}
           SLACK_RESPOND_NOTIFY: ${{ secrets.SLACK_RESPOND_NOTIFY }}
-        run: python planamonitor.py --config config.cloud.yaml ${{ inputs.selftest && '--selftest' || '' }}
+        run: python planamonitor.py --config config.cloud.yaml ${{ inputs.mode == 'selftest' && '--selftest' || inputs.mode == 'stresstest' && '--stresstest' || inputs.mode == 'stresstest-clean' && '--stresstest-clean' || '' }}
       - name: Save state + dashboard data
         run: |
           git config user.name  "plan-a-monitor"

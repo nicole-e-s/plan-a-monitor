@@ -1584,14 +1584,113 @@ def selftest(config):
           + (" posted to Slack." if wh and wh != "FILL IN" else " (printed; no webhook set)."))
 
 
+def stresstest(config, state_dir="."):
+    """Push a labeled burst of synthetic mentions through the FULL pipeline —
+    state files, dashboard, spike/surge detection, Slack — to prove volume
+    shows up end to end. Every ping is redirected to the operator so nobody
+    else gets paged by a drill. Artifacts are flagged and removed afterwards
+    with --stresstest-clean."""
+    _ERRORS.clear()
+    now = datetime.now(timezone.utc)
+    op = config.get("slack", {}).get("error_notify", "")
+    cfg = dict(config)
+    cfg["slack"] = dict(config.get("slack", {}))
+    cfg["slack"]["respond_notify"] = [op] if op else []
+    cfg["slack"]["digest_title"] = ("🧪 STRESSTEST (ignore) — "
+                                    + config.get("slack", {}).get("digest_title", "Plan A monitor"))
+
+    def mk(i, sent, theme, text, plat="twitter", imp=0, likes=0, reposts=0, followers=0):
+        m = Mention(platform=plat, id=f"stresstest-{i}", url="https://example.com/stresstest",
+                    text=text, author=f"@stress_user{i}", author_name=f"Stress User {i}",
+                    author_followers=followers, created_at=now,
+                    engagement=likes + 2 * reposts,
+                    metrics=({"likes": likes, "reposts": reposts, "quotes": 0, "replies": 0,
+                              "impressions": imp} if plat == "twitter"
+                             else {"points": likes, "num_comments": reposts}))
+        m.relevant, m.sentiment, m.theme, m.summary = True, sent, theme, text
+        return m
+
+    fake = [mk(i, "negative", "stresstest wave A", f"STRESSTEST: negative reaction #{i}")
+            for i in range(18)]
+    fake += [mk(20 + i, "negative", "stresstest wave B", f"STRESSTEST: skeptical thread #{i}",
+                plat="hackernews", likes=3, reposts=2) for i in range(6)]
+    fake += [mk(30 + i, "neutral", "stresstest chatter", f"STRESSTEST: neutral mention #{i}")
+             for i in range(5)]
+    fake += [mk(40 + i, "positive", "stresstest praise", f"STRESSTEST: positive mention #{i}")
+             for i in range(5)]
+    fake.append(mk(50, "negative", "stresstest viral", "STRESSTEST: sample viral negative post",
+                   imp=300_000, likes=1200, reposts=400, followers=80_000))
+
+    score_mentions(fake, cfg)
+    agg = aggregate(fake, cfg)
+    baseline = baseline_and_record(agg["total"],
+                                   {n["label"]: n["count"] for n in agg["narratives"]}, state_dir)
+    spike, ratio = detect_spike(agg["total"], baseline, cfg.get("spike_factor", 3.0))
+    record_timeseries(agg, fake, state_dir)
+    # flag what we just wrote so --stresstest-clean can surgically remove it
+    for fname in (_TS, _HIST):
+        path = os.path.join(state_dir, fname)
+        data = _load(path, [])
+        if data:
+            data[-1]["test"] = True
+            with open(path, "w") as f:
+                json.dump(data, f)
+
+    payloads = build_tier_payloads(fake, agg, spike, ratio, cfg, state_dir)
+    redirect = f"<@{op}>" if op else ""
+    for p in payloads:
+        p["text"] = p["text"].replace("<!channel>", redirect)   # drill: never page the channel
+    wh = config.get("slack", {}).get("webhook_url", "")
+    for p in payloads:
+        if wh and wh != "FILL IN":
+            post_slack_payload(wh, p)
+        else:
+            print("\n▸ " + p["text"] + "\n" + p["attachments"][0]["text"][:500])
+    print(f"Stresstest: {len(fake)} synthetic mentions injected, {len(payloads)} alert message(s), "
+          f"spike={spike} ({ratio}x baseline {baseline:.1f}). The dashboard should now show the burst. "
+          f"Remove it afterwards with --stresstest-clean (Actions: mode 'stresstest-clean').")
+
+
+def stresstest_clean(state_dir="."):
+    """Remove everything a stresstest wrote into the state files."""
+    for fname in (_TS, _HIST):
+        path = os.path.join(state_dir, fname)
+        data = _load(path, [])
+        kept = [e for e in data if not e.get("test")]
+        with open(path, "w") as f:
+            json.dump(kept, f)
+        print(f"{fname}: removed {len(data) - len(kept)} test entries.")
+    path = os.path.join(state_dir, _ALERTED)
+    alerted = _load(path, {})
+    kept_a = {k: v for k, v in alerted.items() if "stresstest" not in k}
+    with open(path, "w") as f:
+        json.dump(kept_a, f)
+    print(f"{_ALERTED}: removed {len(alerted) - len(kept_a)} test entries.")
+    seen_path = os.path.join(state_dir, _SEEN)
+    seen = _load(seen_path, [])
+    kept_s = [s for s in seen if "stresstest" not in s]
+    with open(seen_path, "w") as f:
+        json.dump(kept_s, f)
+    print(f"{_SEEN}: removed {len(seen) - len(kept_s)} test entries.")
+    print("Stresstest data removed; the dashboard reverts on its next refresh.")
+
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--selftest", action="store_true",
                     help="post labeled sample alerts (one per tier) + source connectivity check")
+    ap.add_argument("--stresstest", action="store_true",
+                    help="inject a labeled synthetic burst through the full pipeline (pings operator only)")
+    ap.add_argument("--stresstest-clean", action="store_true",
+                    help="remove stresstest data from the state files")
     args = ap.parse_args()
     if args.selftest:
         return selftest(load_config(args.config))
+    if args.stresstest:
+        return stresstest(load_config(args.config))
+    if args.stresstest_clean:
+        return stresstest_clean()
     run(load_config(args.config), dry_run=args.dry_run)
 if __name__ == "__main__":
     sys.exit(main())
