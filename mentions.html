@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan A — mention log</title>
+<style>
+  :root{--bg:#0f1216;--card:#171b21;--ink:#e8eaed;--mut:#9aa3ad;--line:#262c34;
+        --pos:#34c759;--neg:#ff453a;--neu:#8e8e93;--accent:#5e9bff;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:20px 24px;border-bottom:1px solid var(--line);display:flex;
+    align-items:baseline;gap:14px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0} .sub{color:var(--mut);font-size:13px}
+  header a{color:var(--accent);text-decoration:none;font-size:13px}
+  .wrap{padding:20px 24px;max-width:1100px;margin:0 auto}
+  .controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;align-items:center}
+  .btn{background:var(--card);border:1px solid var(--line);color:var(--mut);border-radius:999px;
+    padding:5px 14px;font-size:13px;cursor:pointer}
+  .btn.on{color:var(--ink);border-color:var(--accent)}
+  select,input[type=search]{background:var(--card);border:1px solid var(--line);color:var(--ink);
+    border-radius:8px;padding:6px 10px;font-size:13px}
+  input[type=search]{flex:1;min-width:180px}
+  .day{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em;
+    margin:18px 0 4px;border-bottom:1px solid var(--line);padding-bottom:4px}
+  .item{padding:10px 0;border-bottom:1px solid var(--line)} .item:last-child{border:0}
+  .item a{color:var(--accent);text-decoration:none} .item a:hover{text-decoration:underline}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}
+  .meta{color:var(--mut);font-size:12px}
+  .empty{color:var(--mut);padding:14px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>Plan A — mention log</h1>
+  <span class="sub" id="status">loading…</span>
+  <a href="dashboard.html">← dashboard</a>
+</header>
+<div class="wrap">
+  <div class="controls">
+    <button class="btn on" data-s="all">All</button>
+    <button class="btn" data-s="negative">🔴 Negative</button>
+    <button class="btn" data-s="positive">🟢 Positive</button>
+    <button class="btn" data-s="neutral">⚪ Neutral</button>
+    <select id="plat"><option value="all">all platforms</option></select>
+    <input type="search" id="q" placeholder="search text or author…">
+  </div>
+  <div id="list"><div class="empty">loading…</div></div>
+</div>
+<script>
+// Data comes from the repo directly (raw.githubusercontent.com), same as the
+// dashboard, so it's fresh without waiting on a GitHub Pages build.
+const RAW='https://raw.githubusercontent.com/nicole-e-s/plan-a-monitor/main/mentions.json';
+const DOT={positive:'var(--pos)',negative:'var(--neg)',mixed:'var(--neg)',neutral:'var(--neu)',unknown:'var(--neu)'};
+let all=[], sent='all';
+const esc=s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+
+function render(){
+  const plat=document.getElementById('plat').value;
+  const q=document.getElementById('q').value.trim().toLowerCase();
+  let rows=all.filter(m=>
+    (sent==='all'||m.sentiment===sent||(sent==='negative'&&m.sentiment==='mixed'))&&
+    (plat==='all'||m.platform===plat)&&
+    (!q||(m.summary||'').toLowerCase().includes(q)||(m.author||'').toLowerCase().includes(q)));
+  rows=[...rows].reverse();                       // newest first
+  document.getElementById('status').textContent=rows.length+' of '+all.length+' mentions';
+  if(!rows.length){document.getElementById('list').innerHTML='<div class="empty">Nothing matches.</div>';return;}
+  let html='',day='';
+  for(const m of rows.slice(0,400)){
+    const d=new Date(m.ts).toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'});
+    if(d!==day){day=d;html+=`<div class="day">${d}</div>`;}
+    const eng=m.engagement?` · ${m.engagement} engagement`:'';
+    html+=`<div class="item"><span class="dot" style="background:${DOT[m.sentiment]||'var(--neu)'}"></span>
+      <a href="${esc(m.url)}" target="_blank">${esc(m.summary)||esc(m.url)}</a>
+      <div class="meta">${esc(m.platform)} · ${esc(m.author)} · ${esc(m.sentiment)}${eng} ·
+        ${new Date(m.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div></div>`;
+  }
+  if(rows.length>400)html+=`<div class="empty">…and ${rows.length-400} older (use filters/search).</div>`;
+  document.getElementById('list').innerHTML=html;
+}
+
+async function load(){
+  try{
+    let r=await fetch(RAW+'?_='+Date.now(),{cache:'no-store'});
+    if(!r.ok) r=await fetch('mentions.json?_='+Date.now());
+    all=await r.json();
+  }catch(e){
+    try{const r=await fetch('mentions.json?_='+Date.now()); all=await r.json();}
+    catch(e2){document.getElementById('status').textContent='no mention log yet';
+      document.getElementById('list').innerHTML='<div class="empty">No mentions recorded yet.</div>';return;}
+  }
+  const plats=[...new Set(all.map(m=>m.platform))].sort();
+  const sel=document.getElementById('plat'), cur=sel.value;
+  sel.innerHTML='<option value="all">all platforms</option>'+plats.map(p=>`<option${p===cur?' selected':''}>${p}</option>`).join('');
+  render();
+}
+document.querySelectorAll('.btn').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.btn').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on'); sent=b.dataset.s; render();});
+document.getElementById('plat').onchange=render;
+document.getElementById('q').oninput=render;
+load(); setInterval(load, 120000);
+</script>
+</body>
+</html>

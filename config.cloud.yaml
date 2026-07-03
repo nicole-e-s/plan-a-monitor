@@ -247,6 +247,8 @@ mode: alerts
 slack:
   webhook_url: ''
   digest_title: "Plan A \u2014 public response monitor"
+  # Linked from the daily digest \u2014 the browsable log of every mention:
+  mentions_log_url: https://nicole-e-s.github.io/plan-a-monitor/mentions.html
   # Slack member IDs are private and come from GitHub Actions secrets:
   #   SLACK_ERROR_NOTIFY   — one member ID, pinged when the monitor errors out
   #                          or silently degrades (health alerts)

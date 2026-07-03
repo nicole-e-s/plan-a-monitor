@@ -977,6 +977,7 @@ _TS = "timeseries.json"
 _WARNED = "warned.json"          # narrative-build cooldowns
 _DIGEST = "digest_state.json"    # last daily-digest date
 _HEALTH = "health_state.json"    # last health-ping signature (repeat suppression)
+_MENTIONS = "mentions.json"      # running log of every relevant mention (public)
 
 
 def _load(path, default):
@@ -1087,6 +1088,30 @@ def record_timeseries(agg, new_mentions, state_dir="."):
     with open(path, "w") as f:
         json.dump(ts, f)
     return ts
+
+
+def record_mentions(new_mentions, state_dir="."):
+    """Append EVERY relevant mention, big or small, to a running log — the
+    team's 'find it and respond' queue (mentions.html reads this). The file is
+    public, so watchlist tags are stripped from summaries."""
+    if not new_mentions:
+        return
+    path = os.path.join(state_dir, _MENTIONS)
+    log = _load(path, [])
+    for m in new_mentions:
+        log.append({
+            "ts": (m.created_at or datetime.now(timezone.utc)).isoformat(),
+            "platform": m.platform,
+            "author": m.author or m.author_name,
+            "sentiment": m.sentiment,
+            "tier": m.tier,
+            "engagement": m.engagement,
+            "url": m.url,
+            "summary": re.sub(r"^\[[^\]]{0,80}\]\s*", "", m.summary or m.text[:160]),
+        })
+    log = log[-3000:]
+    with open(path, "w") as f:
+        json.dump(log, f)
 
 
 def filter_unalerted(individual, state_dir=".", escalate_factor=4.0):
@@ -1441,6 +1466,9 @@ def build_daily_digest(config, state_dir="."):
                      f"<{n.get('url', '')}|{(n.get('summary') or '')[:90]}>")
     if total == 0:
         lines.append("_Quiet day — no relevant mentions recorded._")
+    log_url = config.get("slack", {}).get("mentions_log_url", "")
+    if log_url:
+        lines.append(f"<{log_url}|Full mention log →>")
     title = config.get("slack", {}).get("digest_title", "Plan A monitor")
     return {"text": f"⚪ *{title} — daily summary, {now.strftime('%b %-d')}*",
             "attachments": [{"color": "#B0B0B0", "text": "\n".join(lines),
@@ -1571,6 +1599,7 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     spike, ratio = detect_spike(agg["total"], baseline, config.get("spike_factor", 3.0),
                                 int(config.get("spike_min_mentions", 10)))
     record_timeseries(agg, new, state_dir)
+    record_mentions(new, state_dir)
     title = config.get("slack", {}).get("digest_title", "Plan A monitor")
     mode = config.get("mode", "alerts")
     wh = config.get("slack", {}).get("webhook_url", "")

@@ -49,7 +49,7 @@ jobs:
           # add one file at a time: some state files don't exist until their
           # feature first fires, and a single missing pathspec makes git add
           # stage NOTHING (which silently froze the dashboard on 2026-07-02)
-          for f in seen_ids.json alerted.json run_history.json timeseries.json warned.json digest_state.json health_state.json; do
+          for f in seen_ids.json alerted.json run_history.json timeseries.json warned.json digest_state.json health_state.json mentions.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           if git diff --staged --quiet; then
