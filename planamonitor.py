@@ -343,13 +343,13 @@ def fetch_news(terms, since, cfg) -> list[Mention]:
     pickup_threshold = int(cfg.get("pickup_threshold", 5))
     min_tier = int(cfg.get("min_tier", 2))          # 1 = only top outlets, 2 = top+mid
 
-    # 1) gather raw articles
+    # 1) gather raw articles — ONE combined OR query, not one request per term:
+    # Google News 503-throttles datacenter IPs when hit 8x every 5 minutes.
     raw = []
-    for term in terms:
-        try:
-            raw += _fetch_rss(term)
-        except Exception as e:
-            _note_error(f"[News] fetch error for '{term}': {e}")
+    try:
+        raw = _fetch_rss(" OR ".join(f'"{t}"' for t in terms), limit=100)
+    except Exception as e:
+        _note_error(f"[News] fetch error: {e}")
     # de-dupe identical links, keep within time window
     seen_links, articles = set(), []
     for a in raw:
@@ -960,6 +960,7 @@ _ALERTED = "alerted.json"
 _TS = "timeseries.json"
 _WARNED = "warned.json"          # narrative-build cooldowns
 _DIGEST = "digest_state.json"    # last daily-digest date
+_HEALTH = "health_state.json"    # last health-ping signature (repeat suppression)
 
 
 def _load(path, default):
@@ -1479,18 +1480,36 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
 
     # Health check: if anything failed this run (a source error, an AI
     # fallback, a missing key), ping the operator — never degrade silently.
+    # A cooldown stops the SAME persistent problem from re-paging every 5 min;
+    # any new/different problem still pings immediately.
     if _ERRORS:
-        notify_id = config.get("slack", {}).get("error_notify", "")
-        ping = ((f"<@{notify_id}> " if notify_id else "")
-                + f"⚠️ *Plan A monitor* hit {len(_ERRORS)} issue(s) this run:\n"
-                + "\n".join(f"• {e}" for e in _ERRORS[:20]))
-        if live:
-            try:
-                post_to_slack(wh, ping); print(f"Posted health warning ({len(_ERRORS)} issue(s)).")
-            except Exception as e:
-                print(f"  [health] could not post error ping: {e}")
+        sig = "|".join(sorted(set(_ERRORS)))
+        hpath = os.path.join(state_dir, _HEALTH)
+        hstate = _load(hpath, {})
+        suppress = False
+        try:
+            if hstate.get("sig") == sig and (datetime.now(timezone.utc)
+                    - datetime.fromisoformat(hstate["ts"])) < timedelta(
+                    hours=float(config.get("health_ping_cooldown_hours", 6))):
+                suppress = True
+        except Exception:
+            pass
+        if suppress:
+            print(f"Health issues unchanged ({len(_ERRORS)}) — ping suppressed (cooldown).")
         else:
-            print("\n" + "-"*70 + "\nHEALTH (dry run)\n" + "-"*70 + "\n" + ping)
+            notify_id = config.get("slack", {}).get("error_notify", "")
+            ping = ((f"<@{notify_id}> " if notify_id else "")
+                    + f"⚠️ *Plan A monitor* hit {len(_ERRORS)} issue(s) this run:\n"
+                    + "\n".join(f"• {e}" for e in _ERRORS[:20]))
+            if live:
+                try:
+                    post_to_slack(wh, ping); print(f"Posted health warning ({len(_ERRORS)} issue(s)).")
+                except Exception as e:
+                    print(f"  [health] could not post error ping: {e}")
+            else:
+                print("\n" + "-"*70 + "\nHEALTH (dry run)\n" + "-"*70 + "\n" + ping)
+            with open(hpath, "w") as f:
+                json.dump({"sig": sig, "ts": datetime.now(timezone.utc).isoformat()}, f)
 
     # Once-a-day quiet summary (no pings) — fires on the first run after the
     # configured hour, driven by the same 5-min cron.
