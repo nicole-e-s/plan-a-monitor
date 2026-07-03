@@ -146,8 +146,22 @@ spike_factor: 3.0
 # A volume spike needs at least this many mentions in one run before it can
 # warn — stops "24x normal" false alarms when normal is close to zero.
 spike_min_mentions: 10
+# A theme cluster of small posts warns only when it's this big AND mostly
+# negative (>= neg_surge_share). Positive/neutral chatter goes to the
+# dashboard, not to a ping.
 cluster_alert_count: 6
+# Negativity surge warns only when a window has BOTH at least neg_surge_count
+# negatives AND negatives make up at least neg_surge_share of the window.
+# The share test is what keeps a loud-but-proportionate launch day from
+# pinging every 5 minutes; a real sentiment shift still fires.
 neg_surge_count: 5
+neg_surge_share: 0.4
+# After a surge warning, wait this long before re-warning (the team already
+# knows). Critical single-post alerts ignore this cooldown.
+neg_surge_cooldown_hours: 2
+# A volume spike PINGS (orange warning) only when negatives are at least this
+# share of the window; otherwise it posts as a quiet no-ping notice.
+spike_negative_share: 0.25
 escalate_factor: 4.0
 # --- slow-building narrative detection ---
 # Besides the per-window alert_count above, a narrative also WARNs when its

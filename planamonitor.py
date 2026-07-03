@@ -1291,19 +1291,78 @@ def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
     #    went out as CRITICAL, so nothing double-posts.
     warn_reasons = []
     negs = [m for m in new if m.sentiment in ("negative", "mixed")]
-    if len(negs) >= int(config.get("neg_surge_count", 5)):
-        warn_reasons.append(f"negativity surge — {len(negs)} negative mentions this window")
+    n_neg, total = len(negs), max(agg.get("total", 0), 1)
+    neg_share = n_neg / total
+
+    # Negativity surge: needs BOTH enough negatives AND negatives taking over
+    # the window — the share test keeps a loud-but-proportionate launch day
+    # from warning every 5 minutes, while a real sentiment shift still fires.
+    # A cooldown stops back-to-back re-warns for the same ongoing bad cycle;
+    # CRITICAL single-post alerts are unaffected by it.
+    if n_neg >= int(config.get("neg_surge_count", 5)) and \
+       neg_share >= float(config.get("neg_surge_share", 0.4)):
+        wpath = os.path.join(state_dir, _WARNED)
+        warned = _load(wpath, {})
+        now = datetime.now(timezone.utc)
+        cooled = False
+        try:
+            cooled = (now - datetime.fromisoformat(warned["_neg_surge"])) < timedelta(
+                hours=float(config.get("neg_surge_cooldown_hours", 2)))
+        except Exception:
+            pass
+        if cooled:
+            print("Negativity surge still active — warning suppressed (cooldown).")
+        else:
+            warn_reasons.append(f"negativity surge — {n_neg} of {agg['total']} mentions "
+                                f"negative ({neg_share:.0%})")
+            warned["_neg_surge"] = now.isoformat()
+            with open(wpath, "w") as f:
+                json.dump(warned, f)
+
     for n in agg.get("narratives", []):
         if n.get("alert"):
             warn_reasons.append(f"narrative '{n['label']}' — {n['count']} mentions")
     for b in narrative_build_hits(config, state_dir):
         warn_reasons.append(f"narrative '{b['label']}' BUILDING — {b['count']} mentions over {b['days']} days")
+    # Small-post pattern clusters warn only when MOSTLY NEGATIVE — on a launch
+    # day every window has 6+ small posts on some theme, and positive/neutral
+    # chatter is dashboard material, not a page. Per-theme cooldown like the
+    # surge's, so a persistent hostile theme warns once per cycle, not per run.
     cluster_bar = int(config.get("cluster_alert_count", 6))
+    min_neg_pct = 100 * float(config.get("neg_surge_share", 0.4))
     for t in agg.get("themes", []):
-        if t["count"] >= cluster_bar and t.get("mostly_small"):
+        if t["count"] >= cluster_bar and t.get("mostly_small") and t["neg_pct"] >= min_neg_pct:
+            key = "_cluster:" + t["theme"]
+            wpath = os.path.join(state_dir, _WARNED)
+            warned = _load(wpath, {})
+            now = datetime.now(timezone.utc)
+            try:
+                if (now - datetime.fromisoformat(warned[key])) < timedelta(
+                        hours=float(config.get("neg_surge_cooldown_hours", 2))):
+                    continue
+            except Exception:
+                pass
+            warned[key] = now.isoformat()
+            with open(wpath, "w") as f:
+                json.dump(warned, f)
             warn_reasons.append(f"pattern '{t['theme']}' — {t['count']} small posts, {t['neg_pct']}% neg")
+
+    # Volume spike pings only when negative-heavy. A mostly neutral/positive
+    # spike is information ("it's landing"), not a summons — it posts as a
+    # quiet grey no-ping notice instead.
+    quiet_spike = None
     if spike:
-        warn_reasons.append(f"volume spike — {agg['total']} mentions, ≈{ratio}× the recent average")
+        line = f"volume spike — {agg['total']} mentions, ≈{ratio}× the recent average"
+        if neg_share >= float(config.get("spike_negative_share", 0.25)):
+            warn_reasons.append(line)
+        else:
+            sent = agg.get("by_sentiment", {})
+            quiet_spike = {"text": f"📈 *Volume spike (mostly neutral/positive)* — {title}",
+                           "attachments": [{"color": "#B0B0B0", "mrkdwn_in": ["text"],
+                                            "fallback": "volume spike",
+                                            "text": (line + f"\nSentiment — 🟢 {sent.get('positive', 0)} "
+                                                     f"· ⚪ {sent.get('neutral', 0) + sent.get('mixed', 0)} "
+                                                     f"· 🔴 {sent.get('negative', 0)}")}]}
 
     payloads = []
     for tier_key in _TIER_ORDER:
@@ -1313,6 +1372,8 @@ def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
                 payloads.append(_tier_payload("warning", small, warn_reasons, responders, title))
         elif by_tier.get(tier_key):
             payloads.append(_tier_payload(tier_key, by_tier[tier_key], None, responders, title))
+    if quiet_spike:
+        payloads.append(quiet_spike)
     return payloads
 
 
