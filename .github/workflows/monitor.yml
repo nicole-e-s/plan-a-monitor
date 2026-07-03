@@ -56,6 +56,13 @@ jobs:
             echo "no state changes"
           else
             git commit -m "monitor state $(date -u +%FT%TZ)"
-            git pull --rebase --autostash || true
-            git push
+            # two near-simultaneous runs (pinger + manual click) can race on
+            # this push; losing the race just drops one 5-min data point,
+            # which the monitor's gap-widening recovers — warn, don't fail
+            if git pull --rebase --autostash && git push; then
+              echo "state pushed"
+            else
+              git rebase --abort 2>/dev/null || true
+              echo "::warning::state push lost a race with a concurrent run; next run re-records"
+            fi
           fi
