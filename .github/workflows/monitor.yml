@@ -7,7 +7,12 @@ on:
     # real cadence; this cron is the fallback. Offset from :00 to dodge the
     # top-of-hour stampede.
     - cron: "2-57/5 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      selftest:
+        description: "Post labeled sample alerts to Slack (tests pings/colors/sources); no state changes"
+        type: boolean
+        default: false
 
 concurrency:
   group: plan-a-monitor
@@ -35,7 +40,7 @@ jobs:
           WATCHLIST_YAML: ${{ secrets.WATCHLIST_YAML }}
           SLACK_ERROR_NOTIFY: ${{ secrets.SLACK_ERROR_NOTIFY }}
           SLACK_RESPOND_NOTIFY: ${{ secrets.SLACK_RESPOND_NOTIFY }}
-        run: python planamonitor.py --config config.cloud.yaml
+        run: python planamonitor.py --config config.cloud.yaml ${{ inputs.selftest && '--selftest' || '' }}
       - name: Save state + dashboard data
         run: |
           git config user.name  "plan-a-monitor"

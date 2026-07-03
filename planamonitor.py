@@ -1438,6 +1438,8 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     _ERRORS.clear()
     if not config.get("watchlist"):
         _note_error("watchlist is EMPTY — WATCHLIST_YAML secret missing/unset? Watchlist alerts are OFF.")
+    if not config.get("sources", {}).get("twitter", {}).get("enabled"):
+        _note_error("X/Twitter is OFF — X_BEARER_TOKEN secret missing? It's the most important source.")
     now = datetime.now(timezone.utc)
     # GitHub's cron is best-effort: gaps of 2-3 HOURS between scheduled runs
     # have been observed. If the last run was longer ago than the configured
@@ -1519,9 +1521,77 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
         for p in payloads:
             print(f"\n▸ {p['text']}\n{p['attachments'][0]['text']}")
     return payloads
+def selftest(config):
+    """Post one clearly-labeled sample alert per tier through the real Slack
+    pipeline (verifies pings, colors, member IDs), plus a live connectivity
+    check of every enabled source. Touches no state files."""
+    import tempfile
+    _ERRORS.clear()
+    state_dir = tempfile.mkdtemp(prefix="selftest-")
+    now = datetime.now(timezone.utc)
+    wl = config.get("watchlist", [])
+    wl_name = wl[0]["name"] if wl else "Watchlist Person"
+    wl_handle = (wl[0].get("handles") or ["@watchlist_person"])[0] if wl else "@watchlist_person"
+
+    def mk(i, author, name, text, sent, followers=0, imp=0, likes=0, reposts=0):
+        m = Mention(platform="twitter", id=f"selftest-{i}", url="https://example.com/selftest",
+                    text=text, author=author, author_name=name,
+                    author_followers=followers, created_at=now,
+                    engagement=likes + 2 * reposts,
+                    metrics={"likes": likes, "reposts": reposts, "quotes": 0,
+                             "replies": 0, "impressions": imp})
+        m.relevant, m.sentiment, m.summary = True, sent, text
+        return m
+
+    fake = [
+        mk(1, wl_handle, wl_name, "TEST: sample negative take from a watchlist person", "negative"),
+        mk(2, "@viral_account", "Viral Account", "TEST: sample viral negative post", "negative",
+           followers=50_000, imp=250_000, likes=900, reposts=300),
+        mk(3, wl_handle, wl_name, "TEST: sample positive take from a watchlist person", "positive"),
+        mk(4, "@big_account", "Big Account", "TEST: sample neutral post from a large account",
+           "neutral", followers=400_000, imp=120_000, likes=60, reposts=10),
+    ] + [mk(10 + i, f"@small{i}", f"Small {i}", "TEST: sample small negative post", "negative")
+         for i in range(6)]
+
+    score_mentions(fake, config)
+    agg = aggregate(fake, config)
+    cfg2 = dict(config)
+    cfg2["slack"] = dict(config.get("slack", {}))
+    cfg2["slack"]["digest_title"] = ("🧪 SELFTEST (ignore) — "
+                                     + config.get("slack", {}).get("digest_title", "Plan A monitor"))
+    payloads = build_tier_payloads(fake, agg, False, 0.0, cfg2, state_dir)
+
+    # live connectivity check: one small real fetch per enabled source
+    try:
+        counts = Counter(m.platform for m in fetch_all(config, now - timedelta(minutes=30)))
+        src_line = (", ".join(f"{k}: {v}" for k, v in counts.items())
+                    or "no matching posts in the last 30 min (normal when quiet)")
+    except Exception as e:
+        src_line = f"fetch failed: {e}"
+    err_line = "\n".join("• " + e for e in _ERRORS) if _ERRORS else "none"
+    payloads.append({"text": "🧪 *SELFTEST — source connectivity*",
+                     "attachments": [{"color": "#B0B0B0", "mrkdwn_in": ["text"],
+                                      "text": f"Fetched just now — {src_line}\nSource errors: {err_line}",
+                                      "fallback": "selftest"}]})
+
+    wh = config.get("slack", {}).get("webhook_url", "")
+    for p in payloads:
+        if wh and wh != "FILL IN":
+            post_slack_payload(wh, p)
+        else:
+            print("\n▸ " + p["text"] + "\n" + p["attachments"][0]["text"])
+    print(f"Selftest complete: {len(payloads)} message(s)"
+          + (" posted to Slack." if wh and wh != "FILL IN" else " (printed; no webhook set)."))
+
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--dry-run", action="store_true"); args = ap.parse_args()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="post labeled sample alerts (one per tier) + source connectivity check")
+    args = ap.parse_args()
+    if args.selftest:
+        return selftest(load_config(args.config))
     run(load_config(args.config), dry_run=args.dry_run)
 if __name__ == "__main__":
     sys.exit(main())
