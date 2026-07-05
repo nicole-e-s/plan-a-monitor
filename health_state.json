@@ -1,1 +1,1 @@
-{"sig": "[News] fetch error after 3 tries: HTTP Error 503: Service Unavailable", "ts": "2026-07-05T20:56:16.800610+00:00", "news_last_ok": "2026-07-05T22:55:11.636699+00:00"}
+{"sig": "[X] fetch error: HTTP Error 403: Forbidden", "ts": "2026-07-05T23:00:53.676141+00:00", "news_last_ok": "2026-07-05T23:00:40.633091+00:00"}
