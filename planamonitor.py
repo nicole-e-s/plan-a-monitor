@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plan A Monitor — single-file build (all modules combined)."""
 from __future__ import annotations
-import argparse, base64, json, os, re, sys, time, urllib.parse, urllib.request
+import argparse, base64, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -57,8 +57,20 @@ class Mention:
 
 def _get_json(url: str, headers: dict | None = None, timeout: int = 15):
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        # surface the response body — APIs (esp. X pay-per-use) put the actual
+        # reason there ("credits depleted", "not enrolled", ...), and a bare
+        # "403 Forbidden" is undiagnosable from a Slack ping
+        try:
+            detail = re.sub(r"\s+", " ", e.read(500).decode("utf-8", "ignore")).strip()
+        except Exception:
+            detail = ""
+        if detail:
+            e.msg = f"{e.msg} — {detail[:250]}"
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -1577,16 +1589,46 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
         max(config.get("twitter_lookback_minutes", 10), pad_min), 12 * 60)
     if gap_min > 30:
         print(f"  [cron] {gap_min:.0f} min since last run — widening fetch windows to cover the gap.")
+
+    # News runs on its own slower clock (Google 503-throttles datacenter IPs
+    # when polled every 5 min). Skip the fetch unless the interval has passed;
+    # the stretched news window above means an hourly pull misses nothing.
+    news_on = config.get("sources", {}).get("news", {}).get("enabled")
+    news_attempted = False
+    if news_on:
+        try:
+            mins_since_try = (now - datetime.fromisoformat(hstate["news_last_try"])).total_seconds() / 60
+        except Exception:
+            mins_since_try = 1e9
+        if mins_since_try < float(config.get("news_fetch_interval_minutes", 60)):
+            config["sources"]["news"]["enabled"] = False
+            print(f"  [news] fetched {mins_since_try:.0f} min ago — next pull in "
+                  f"{float(config.get('news_fetch_interval_minutes', 60)) - mins_since_try:.0f} min.")
+        else:
+            news_attempted = True
+
     since = now - timedelta(hours=lb_hours)
     if mentions is None: mentions = fetch_all(config, since)
     print(f"Fetched {len(mentions)} raw mentions.")
-    # record the last time Google News answered, for the outage-stretch above
-    if config.get("sources", {}).get("news", {}).get("enabled") and \
-       not any(e.startswith("[News]") for e in _ERRORS):
+    if news_on:
+        config["sources"]["news"]["enabled"] = True   # restore for downstream checks
+    if news_attempted:
         hs = _load(os.path.join(state_dir, _HEALTH), {})
-        hs["news_last_ok"] = now.isoformat()
+        hs["news_last_try"] = now.isoformat()
+        if not any(e.startswith("[News]") for e in _ERRORS):
+            hs["news_last_ok"] = now.isoformat()      # feeds the outage-stretch above
         with open(os.path.join(state_dir, _HEALTH), "w") as f:
             json.dump(hs, f)
+    # A failed news pull is routine (Google throttling) — only worth a ping if
+    # news has been dark for hours; the widened window recovers the articles.
+    if any(e.startswith("[News]") for e in _ERRORS):
+        try:
+            down_h = (now - datetime.fromisoformat(hstate["news_last_ok"])).total_seconds() / 3600
+        except Exception:
+            down_h = 1e9
+        if down_h < float(config.get("news_alert_after_hours", 6)):
+            _ERRORS[:] = [e for e in _ERRORS if not e.startswith("[News]")]
+            print(f"  [news] pull failed (throttled; down {down_h:.1f}h) — retrying next window, no ping.")
     _llm = config.get("llm", {})
     if _llm.get("enabled") and _llm.get("api_key", "") in ("", "FILL IN"):
         _note_error("ANTHROPIC_API_KEY not set — running keyword-only classification (low fidelity).")
@@ -1610,37 +1652,46 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
     # A cooldown stops the SAME persistent problem from re-paging every 5 min;
     # any new/different problem still pings immediately.
     if _ERRORS:
-        sig = "|".join(sorted(set(_ERRORS)))
+        # PER-ERROR cooldowns (a single last-signature slot let alternating
+        # X/News errors bypass the cooldown every run — the Jul 4-5 ping storm).
+        # Keys are digit-normalized so "3 item(s)" vs "5 item(s)" don't count
+        # as different problems.
         hpath = os.path.join(state_dir, _HEALTH)
-        hstate = _load(hpath, {})
-        suppress = False
-        try:
-            if hstate.get("sig") == sig and (datetime.now(timezone.utc)
-                    - datetime.fromisoformat(hstate["ts"])) < timedelta(
-                    hours=float(config.get("health_ping_cooldown_hours", 6))):
-                suppress = True
-        except Exception:
-            pass
-        if suppress:
-            print(f"Health issues unchanged ({len(_ERRORS)}) — ping suppressed (cooldown).")
+        hstate2 = _load(hpath, {})
+        errs = hstate2.get("errs", {})
+        cd = timedelta(hours=float(config.get("health_ping_cooldown_hours", 6)))
+        now2 = datetime.now(timezone.utc)
+        fresh = []
+        for e in sorted(set(_ERRORS)):
+            key = re.sub(r"\d+", "#", e)
+            last = errs.get(key)
+            try:
+                if last and now2 - datetime.fromisoformat(last) < cd:
+                    continue
+            except Exception:
+                pass
+            fresh.append((key, e))
+        if not fresh:
+            print(f"Health issues ({len(_ERRORS)}) all recently pinged — suppressed (cooldown).")
         else:
             notify_id = config.get("slack", {}).get("error_notify", "")
             ping = ((f"<@{notify_id}> " if notify_id else "")
-                    + f"⚠️ *Plan A monitor* hit {len(_ERRORS)} issue(s) this run:\n"
-                    + "\n".join(f"• {e}" for e in _ERRORS[:20]))
+                    + f"⚠️ *Plan A monitor* hit {len(fresh)} issue(s) this run:\n"
+                    + "\n".join(f"• {e}" for _, e in fresh[:20]))
             if live:
                 try:
-                    post_to_slack(wh, ping); print(f"Posted health warning ({len(_ERRORS)} issue(s)).")
+                    post_to_slack(wh, ping); print(f"Posted health warning ({len(fresh)} issue(s)).")
                 except Exception as e:
                     print(f"  [health] could not post error ping: {e}")
             else:
                 print("\n" + "-"*70 + "\nHEALTH (dry run)\n" + "-"*70 + "\n" + ping)
-            # load BEFORE opening for write (this file also carries
-            # news_last_ok, and "w" truncates before a same-line load runs)
-            merged = dict(_load(hpath, {}), sig=sig,
-                          ts=datetime.now(timezone.utc).isoformat())
+            for key, _ in fresh:
+                errs[key] = now2.isoformat()
+            hstate2 = _load(hpath, {})       # re-load: news_last_ok may have changed
+            hstate2.pop("sig", None); hstate2.pop("ts", None)
+            hstate2["errs"] = dict(list(errs.items())[-50:])
             with open(hpath, "w") as f:
-                json.dump(merged, f)
+                json.dump(hstate2, f)
 
     # Once-a-day quiet summary (no pings) — fires on the first run after the
     # configured hour, driven by the same 5-min cron.

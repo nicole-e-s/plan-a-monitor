@@ -257,6 +257,13 @@ slack:
   error_notify: ''
   respond_notify: []
 lookback_hours: 1
+# News is pulled at most once per this many minutes (Google 503-throttles
+# datacenter IPs at 5-min polling). The news window auto-widens to cover the
+# gap, so nothing is missed — headlines just arrive up to an hour later.
+news_fetch_interval_minutes: 60
+# Only ping the operator about news failures once news has been dark this long
+# (individual failed pulls are routine throttling and self-recover):
+news_alert_after_hours: 6
 # Per-source lookback overrides:
 twitter_lookback_minutes: 10      # keep X reads cheap (pay-per-use): small overlap with the 5-min cron
 reddit_rss_lookback_hours: 6
