@@ -268,6 +268,10 @@ news_fetch_interval_minutes: 60
 # Only ping the operator about news failures once news has been dark this long
 # (individual failed pulls are routine throttling and self-recover):
 news_alert_after_hours: 6
+# Same for X: Cloudflare randomly challenges GitHub's runner IPs (transient
+# 403s); a single failed run self-heals. Ping only once X has been dark this
+# long — tighter than news because X is the most important source:
+x_alert_after_hours: 2
 # Per-source lookback overrides:
 twitter_lookback_minutes: 10      # keep X reads cheap (pay-per-use): small overlap with the 5-min cron
 reddit_rss_lookback_hours: 6

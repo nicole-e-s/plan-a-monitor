@@ -68,6 +68,10 @@ def _get_json(url: str, headers: dict | None = None, timeout: int = 15):
             detail = re.sub(r"\s+", " ", e.read(500).decode("utf-8", "ignore")).strip()
         except Exception:
             detail = ""
+        if detail.lower().startswith(("<!doctype", "<html")):
+            # an HTML body on an API endpoint = an edge/CDN interception, not
+            # a real API answer; say so instead of dumping markup into Slack
+            detail = "HTML challenge page (Cloudflare bot check on this runner IP — transient)"
         if detail:
             e.msg = f"{e.msg} — {detail[:250]}"
         raise
@@ -178,7 +182,10 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
     if not token or token == "FILL IN":
         print("  [X] no bearer token configured; skipping X this run.")
         return []
-    headers = {"Authorization": f"Bearer {token}"}
+    # A descriptive User-Agent matters: urllib's default ("Python-urllib/3.x")
+    # is a bot signature that Cloudflare — which fronts X's API and challenges
+    # datacenter IPs like GitHub's — weighs heavily.
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "plan-a-monitor/1.0"}
     max_results = int(cfg.get("max_results", 100))
     start_time = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -211,11 +218,20 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
             "user.fields": "username,name,verified,public_metrics",
             "start_time": start_time,
         })
-        url = f"https://api.twitter.com/2/tweets/search/recent?{params}"
-        try:
-            data = _get_json(url, headers=headers)
-        except Exception as e:
-            _note_error(f"[X] fetch error: {e}")
+        url = f"https://api.x.com/2/tweets/search/recent?{params}"
+        # Cloudflare challenges are transient (runner-IP reputation) — retry
+        # before declaring the query failed.
+        data = None
+        for attempt in range(3):
+            try:
+                data = _get_json(url, headers=headers)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(4 * (attempt + 1))
+                else:
+                    _note_error(f"[X] fetch error: {e}")
+        if data is None:
             continue
         users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
         for t in data.get("data", []):
@@ -1655,6 +1671,25 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
         if down_h < float(config.get("news_alert_after_hours", 6)):
             _ERRORS[:] = [e for e in _ERRORS if not e.startswith("[News]")]
             print(f"  [news] pull failed (throttled; down {down_h:.1f}h) — retrying next window, no ping.")
+    # Same treatment for X: Cloudflare challenges GitHub's runner IPs at
+    # random, the 5-min cadence + widened windows self-heal a failed run, and
+    # a dark-for-hours condition is the only thing worth a page. The window is
+    # tighter than news's because X is the most important source.
+    if config.get("sources", {}).get("twitter", {}).get("enabled"):
+        if not any(e.startswith("[X]") for e in _ERRORS):
+            hs = _load(os.path.join(state_dir, _HEALTH), {})
+            hs["x_last_ok"] = now.isoformat()
+            with open(os.path.join(state_dir, _HEALTH), "w") as f:
+                json.dump(hs, f)
+        else:
+            try:
+                x_down_h = (now - datetime.fromisoformat(hstate["x_last_ok"])).total_seconds() / 3600
+            except Exception:
+                x_down_h = 1e9
+            if x_down_h < float(config.get("x_alert_after_hours", 2)):
+                _ERRORS[:] = [e for e in _ERRORS if not e.startswith("[X]")]
+                print(f"  [X] fetch blocked this run (Cloudflare; last ok {x_down_h:.1f}h ago) — "
+                      f"self-heals next run, no ping.")
     _llm = config.get("llm", {})
     if _llm.get("enabled") and _llm.get("api_key", "") in ("", "FILL IN"):
         _note_error("ANTHROPIC_API_KEY not set — running keyword-only classification (low fidelity).")
