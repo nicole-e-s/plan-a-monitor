@@ -194,7 +194,11 @@ sources:
   news:
     enabled: true
     min_tier: 2
+    # A story from smaller outlets still qualifies once this many DISTINCT
+    # outlets have picked it up — counted cumulatively over pickup_window_hours
+    # (stories syndicate over days, not within one hourly pull):
     pickup_threshold: 5
+    pickup_window_hours: 72
     tier1_outlets:
     - New York Times
     - Washington Post

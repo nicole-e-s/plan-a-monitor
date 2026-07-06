@@ -353,7 +353,7 @@ def _fetch_rss(term: str, limit: int = 50):
     return items
 
 
-def fetch_news(terms, since, cfg) -> list[Mention]:
+def fetch_news(terms, since, cfg, state_dir=".") -> list[Mention]:
     tier1 = cfg.get("tier1_outlets", [])
     tier2 = cfg.get("tier2_outlets", [])
     pickup_threshold = int(cfg.get("pickup_threshold", 5))
@@ -384,30 +384,53 @@ def fetch_news(terms, since, cfg) -> list[Mention]:
         a["tier"] = _tier_of(a["outlet"], a["domain"], tier1, tier2)
         articles.append(a)
 
-    # 2) cluster near-duplicate stories
+    # 2) merge into the PERSISTENT cluster state. Stories syndicate over hours
+    # or days, so pickup must accumulate ACROSS pulls — clustering only within
+    # one window meant "5 outlets in an hour", which only wire-service bursts
+    # ever satisfied; organic pickup restarted from zero every pull.
+    path = os.path.join(state_dir, _NEWS_CLUSTERS)
+    now = datetime.now(timezone.utc)
+    horizon = now - timedelta(hours=float(cfg.get("pickup_window_hours", 72)))
     clusters = []
+    for c in _load(path, []):
+        try:
+            if datetime.fromisoformat(c["last_seen"]) >= horizon:
+                clusters.append(c)
+        except Exception:
+            continue
     for a in articles:
-        placed = False
+        placed = None
         for c in clusters:
             if _similar(a["norm"], c["norm"]) >= 0.6:
-                c["members"].append(a)
-                placed = True
+                placed = c
                 break
-        if not placed:
-            clusters.append({"norm": a["norm"], "members": [a]})
+        if placed is None:
+            placed = {"norm": a["norm"], "outlets": {}, "best": None,
+                      "first_seen": now.isoformat(), "emitted_tier": 99}
+            clusters.append(placed)
+        placed["last_seen"] = now.isoformat()
+        if a["outlet"]:
+            placed["outlets"][a["outlet"]] = a["date"].isoformat()
+        if placed["best"] is None or a["tier"] < placed["best"]["tier"]:
+            placed["best"] = {"title": a["title"], "link": a["link"],
+                              "outlet": a["outlet"], "tier": a["tier"],
+                              "date": a["date"].isoformat()}
 
-    # 3) apply the bar + emit one Mention per qualifying cluster
+    # 3) emit one Mention per cluster that qualifies and hasn't already been
+    # emitted at this strength. emitted_tier prevents re-emitting on every new
+    # small pickup, but a LOUDER event — a tier-1/2 outlet joining after a
+    # small-outlet emission — emits again.
     out = []
     for c in clusters:
-        members = c["members"]
-        outlets = {m["outlet"] for m in members if m["outlet"]}
-        best = min(members, key=lambda m: m["tier"])        # lowest tier number = most authoritative
-        best_tier = best["tier"]
-        pickup = len(outlets)
-        qualifies = (best_tier <= min_tier) or (pickup >= pickup_threshold)
-        if not qualifies:
+        best = c.get("best")
+        if not best:
             continue
-        others = sorted(outlets - {best["outlet"]})
+        pickup = len(c["outlets"])
+        qualifies = (best["tier"] <= min_tier) or (pickup >= pickup_threshold)
+        if not qualifies or best["tier"] >= c.get("emitted_tier", 99):
+            continue
+        c["emitted_tier"] = best["tier"]
+        others = sorted(set(c["outlets"]) - {best["outlet"]})
         out.append(Mention(
             platform="news",
             id=best["link"],
@@ -415,11 +438,13 @@ def fetch_news(terms, since, cfg) -> list[Mention]:
             text=re.sub(r"\s*[-–|]\s*[^-–|]+$", "", best["title"]),
             author=best["outlet"],
             author_name=best["outlet"],
-            created_at=best["date"],
-            engagement=pickup * 10 + (100 if best_tier == 1 else 40 if best_tier == 2 else 0),
-            metrics={"outlet": best["outlet"], "tier": best_tier,
+            created_at=datetime.fromisoformat(best["date"]),
+            engagement=pickup * 10 + (100 if best["tier"] == 1 else 40 if best["tier"] == 2 else 0),
+            metrics={"outlet": best["outlet"], "tier": best["tier"],
                      "pickup_count": pickup, "also_covered": others[:10]},
         ))
+    with open(path, "w") as f:
+        json.dump(clusters, f)
     return out
 
 # --------------------------------------------------------------------------
@@ -990,6 +1015,7 @@ _WARNED = "warned.json"          # narrative-build cooldowns
 _DIGEST = "digest_state.json"    # last daily-digest date
 _HEALTH = "health_state.json"    # last health-ping signature (repeat suppression)
 _MENTIONS = "mentions.json"      # running log of every relevant mention (public)
+_NEWS_CLUSTERS = "news_clusters.json"  # cross-run story clusters (pickup accumulates over days)
 
 
 def _load(path, default):
