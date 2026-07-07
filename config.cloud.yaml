@@ -12,10 +12,11 @@ search_terms:
   precision: high
 - query: Lifland
   precision: high
-# "low" = a common-ish name/phrase: it only counts when AIFP context words
-# appear nearby, and the AI double-checks relevance.
+# Full name because bare "Larsen" is too common. High precision even so:
+# he wrote much of Plan A, and the AI scope check filters any same-name
+# strangers that slip through.
 - query: Thomas Larsen
-  precision: low
+  precision: high
 # hashtag form (#AI2040) — the spaced phrase "AI 2040" doesn't match it on X
 - query: AI2040
   precision: high
