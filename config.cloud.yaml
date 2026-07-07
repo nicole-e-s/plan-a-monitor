@@ -3,9 +3,14 @@ search_terms:
   precision: high
 - query: AI Futures Project
   precision: high
-- query: Daniel Kokotajlo
+# Bare surnames for team members whose names are rare enough to be
+# unambiguous — catches "Kokotajlo's timeline" posts that never say "Daniel".
+# (A bare surname search also matches the full name, so no separate
+# full-name term is needed. "Larsen" alone is far too common — that one
+# stays full-name only, below.)
+- query: Kokotajlo
   precision: high
-- query: Eli Lifland
+- query: Lifland
   precision: high
 # "low" = a common-ish name/phrase: it only counts when AIFP context words
 # appear nearby, and the AI double-checks relevance.
