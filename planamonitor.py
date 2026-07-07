@@ -47,6 +47,7 @@ class Mention:
     # filled in later by the relevance/scoring stages:
     confidence: str = "medium"    # high | medium | low (rule-based)
     about: str = ""               # plan_a | aifp_other | unrelated (AI-judged scope)
+    about_conf: str = ""          # high | medium | low — confidence in that scope call
     relevant: Optional[bool] = None
     sentiment: str = "unknown"    # positive | neutral | negative | mixed
     stance: str = ""              # supportive | substantive_critique | dismissive | question | news_share | off_topic
@@ -664,6 +665,8 @@ def keyword_fallback(mentions):
         t = m.text.lower()
         m.about = ("plan_a" if any(k in t for k in ("ai 2040", "ai2040", "ai-2040", "plan a"))
                    else "aifp_other")
+        # keyword matching can vouch for scope only when the term was explicit
+        m.about_conf = "medium" if m.confidence == "high" else "low"
         m.sentiment = keyword_sentiment(m)
         m.theme = _THEME_BY_SENTIMENT.get(m.sentiment, "neutral mentions")
         m.summary = (m.text[:140] + "…") if len(m.text) > 140 else m.text
@@ -688,13 +691,20 @@ _SYSTEM = (
     "- unrelated: a coincidental match — the phrase used generically, a "
     "different person with the same name, or a post about something else "
     "entirely (e.g. a watched author praising some other lab's paper).\n"
-    "NEVER GUESS SCOPE. A post that merely COULD be about Plan A is not "
-    "plan_a — do not infer 'likely referring to Plan A' from vibes or from "
-    "who wrote it; require an explicit signal in the text or linked article. "
-    "Posts marked matched=watchlist_feed come from a watched author's feed "
-    "with NO keyword match at all: hold these to the strictest standard — "
-    "if the post does not explicitly reference AIFP or its publications, it "
-    "is unrelated, full stop. "
+    "Also report scope_confidence (high | medium | low): how sure you are of "
+    "the scope label. Uncertain posts are kept for trend counting but never "
+    "page a human, so honest low confidence beats a guess. Rules:\n"
+    "- Never label plan_a without an explicit signal in the text or linked "
+    "article; do not infer 'likely referring to Plan A' from vibes or from "
+    "who wrote it.\n"
+    "- When torn between aifp_other and unrelated, choose aifp_other with "
+    "scope_confidence low (inclusion is cheap; paging people is not). Use "
+    "unrelated only when you are actually confident the post has nothing to "
+    "do with AIFP.\n"
+    "- Posts marked matched=watchlist_feed come from a watched author's feed "
+    "with NO keyword match: these need an explicit AIFP reference to be "
+    "anything but unrelated. If you cannot tell what such a post refers to, "
+    "use aifp_other with scope_confidence low — never plan_a.\n"
     "Then label sentiment and stance toward AIFP/its work, a short theme, and "
     "a one-sentence neutral summary. The summary must never assert a "
     "connection to Plan A that the post does not explicitly make."
@@ -703,6 +713,7 @@ _SYSTEM = (
 _INSTR = (
     'Return ONLY a JSON array. For each post return an object: '
     '{"i": <index>, "about": "plan_a"|"aifp_other"|"unrelated", '
+    '"scope_confidence": "high"|"medium"|"low", '
     '"sentiment": "positive"|"neutral"|"negative"|"mixed", '
     '"stance": "supportive"|"substantive_critique"|"dismissive"|"question"|"news_share"|"off_topic", '
     '"theme": "<3-6 word label>", "summary": "<one sentence, neutral>"}'
@@ -820,6 +831,8 @@ def ai_classify(mentions, llm_cfg):
                     # legacy/degenerate answer — fall back to the old boolean
                     about = "aifp_other" if r.get("about_aifp", True) else "unrelated"
                 m.about = about
+                conf = r.get("scope_confidence")
+                m.about_conf = conf if conf in ("high", "medium", "low") else "medium"
                 m.relevant = about != "unrelated"
                 m.sentiment = r.get("sentiment", "neutral")
                 m.stance = r.get("stance", "")
@@ -830,12 +843,17 @@ def ai_classify(mentions, llm_cfg):
     _label(mentions, model)
 
     # Pass 2 — re-judge the high-stakes items with the stronger model: what
-    # drives CRITICAL/WARNING alerts (negatives, critiques) plus everything
-    # from watchlist feeds, where a scope mistake pings humans directly.
+    # drives CRITICAL/WARNING alerts (negatives, critiques), everything from
+    # watchlist feeds (a scope mistake there pings humans directly), and
+    # anything the cheap model wasn't confident about — including posts it
+    # wanted to DROP, since dropping also requires confidence.
     if escalate_model and escalate_model not in ("", "FILL IN"):
-        escalate = [m for m in mentions if m.relevant and
-                    (m.sentiment in ("negative", "mixed") or m.stance == "substantive_critique"
-                     or m.metrics.get("from_watchlist") or m.platform == "substack")]
+        escalate = [m for m in mentions if
+                    (m.relevant and (m.sentiment in ("negative", "mixed")
+                                     or m.stance == "substantive_critique"
+                                     or m.metrics.get("from_watchlist")
+                                     or m.platform == "substack"))
+                    or m.about_conf == "low"]
         if escalate:
             print(f"  [AI] escalating {len(escalate)} item(s) to {escalate_model}.")
             _label(escalate, escalate_model, fallback=False)
@@ -845,12 +863,23 @@ def ai_classify(mentions, llm_cfg):
 def classify(mentions, config):
     """Run prefilter then either AI or keyword labeling."""
     kept = prefilter(mentions, config)
-    if config.get("llm", {}).get("enabled") and config["llm"].get("api_key", "") not in ("", "FILL IN"):
+    llm_used = bool(config.get("llm", {}).get("enabled")
+                    and config["llm"].get("api_key", "") not in ("", "FILL IN"))
+    if llm_used:
         ai_classify(kept, config["llm"])
     else:
         keyword_fallback(kept)
-    # keep only the ones judged relevant (AI) or rule-kept (fallback)
-    return [m for m in kept if m.relevant]
+    # Keep the relevant ones. Dropping requires CONFIDENCE: if even the
+    # escalation model wasn't sure a post is unrelated, keep it for counting
+    # (as adjacent) — the low confidence itself blocks it from ever paging.
+    out = []
+    for m in kept:
+        if m.relevant:
+            out.append(m)
+        elif llm_used and m.about_conf == "low":
+            m.about, m.relevant = "aifp_other", True
+            out.append(m)
+    return out
 
 # ===== from analyze.py =====
 
@@ -1344,14 +1373,17 @@ TIER_STYLE = {
 _TIER_ORDER = ["critical", "warning", "positive", "neutral"]
 
 
-def _individual_tier(m, watchlist, scope="plan_a"):
+def _individual_tier(m, watchlist, scope="all_aifp"):
     """Tier for a post that stands on its own — a watchlist author, or a post
     that cleared the attention bar (score_mentions set tier high/critical).
     Returns None if it isn't alert-worthy alone (it still feeds the aggregates).
-    With alert_scope 'plan_a' (default), posts about AIFP-in-general but not
-    the publication (m.about == 'aifp_other') never page individually — a
-    Kokotajlo mention in some other story isn't launch coverage. They still
-    count in the dashboard, mention log, and narrative/surge detection."""
+    Two gates before anything can page a human:
+    - confidence: a post whose relevance even the escalation model wasn't
+      sure about never pings (it still counts everywhere else);
+    - scope: with alert_scope 'plan_a', adjacent-AIFP posts don't ping either.
+      Default 'all_aifp' lets confidently-adjacent posts page when big enough."""
+    if m.about_conf == "low":
+        return None
     if scope == "plan_a" and m.about == "aifp_other":
         return None
     key_figure = _watch_hit(m, watchlist) is not None or m.tier in ("critical", "high")
@@ -1394,7 +1426,7 @@ def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
     watchlist = config.get("watchlist", [])
     responders = config.get("slack", {}).get("respond_notify", [])
     title = config.get("slack", {}).get("digest_title", "Plan A monitor")
-    scope = config.get("alert_scope", "plan_a")
+    scope = config.get("alert_scope", "all_aifp")
 
     # 1) individual posts that alert on their own, deduped so we don't re-ping.
     alertable = [m for m in new if _individual_tier(m, watchlist, scope)]

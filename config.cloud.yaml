@@ -162,12 +162,13 @@ neg_surge_cooldown_hours: 2
 # A volume spike PINGS (orange warning) only when negatives are at least this
 # share of the window; otherwise it posts as a quiet no-ping notice.
 spike_negative_share: 0.25
-# What individual alerts are ABOUT. "plan_a" = only posts explicitly about
-# the AI 2040: Plan A publication can page anyone; a Kokotajlo mention in
-# some unrelated story won't. "all_aifp" = anything genuinely about AIFP or
-# its people alerts too. Adjacent AIFP posts still count in the dashboard,
-# mention log, and narrative/surge detection either way.
-alert_scope: plan_a
+# What individual alerts are ABOUT. "all_aifp" = anything CONFIDENTLY about
+# AIFP or its people can page when it clears the bars (a big satire post
+# about the authors' timelines counts). "plan_a" = stricter: only posts
+# explicitly about the AI 2040: Plan A publication page anyone. Either way,
+# posts whose relevance the AI is uncertain about are counted in the
+# dashboard/log but NEVER page — pings are for real, confident emergencies.
+alert_scope: all_aifp
 escalate_factor: 4.0
 # --- slow-building narrative detection ---
 # Besides the per-window alert_count above, a narrative also WARNs when its
