@@ -46,6 +46,7 @@ class Mention:
 
     # filled in later by the relevance/scoring stages:
     confidence: str = "medium"    # high | medium | low (rule-based)
+    about: str = ""               # plan_a | aifp_other | unrelated (AI-judged scope)
     relevant: Optional[bool] = None
     sentiment: str = "unknown"    # positive | neutral | negative | mixed
     stance: str = ""              # supportive | substantive_critique | dismissive | question | news_share | off_topic
@@ -660,6 +661,9 @@ def keyword_fallback(mentions):
         # "AI 2027" with no context word nearby is exactly the Google-Alerts
         # noise we're trying to avoid, and there's no AI here to vet it.
         m.relevant = m.confidence in ("high", "medium")
+        t = m.text.lower()
+        m.about = ("plan_a" if any(k in t for k in ("ai 2040", "ai2040", "ai-2040", "plan a"))
+                   else "aifp_other")
         m.sentiment = keyword_sentiment(m)
         m.theme = _THEME_BY_SENTIMENT.get(m.sentiment, "neutral mentions")
         m.summary = (m.text[:140] + "…") if len(m.text) > 140 else m.text
@@ -671,20 +675,34 @@ def keyword_fallback(mentions):
 # --------------------------------------------------------------------------
 _SYSTEM = (
     "You are a media-monitoring analyst for the AI Futures Project (AIFP), a "
-    "nonprofit that published the viral 'AI 2027' scenario and is now releasing "
-    "a follow-up titled 'AI 2040: Plan A' (a.k.a. 'Plan A'). Authors include "
+    "nonprofit known for the viral 'AI 2027' scenario and its new publication "
+    "'AI 2040: Plan A' (released early July 2026, ai-2040.com). Authors include "
     "Daniel Kokotajlo, Eli Lifland, Thomas Larsen, Scott Alexander. For each "
-    "social-media post, decide whether it is genuinely about AIFP or its work "
-    "(AI 2027 / AI 2040 / Plan A / its authors / its forecasts) versus a "
-    "coincidental match (e.g. someone using the phrase 'plan A' normally, or "
-    "'AI 2027' meaning a generic year). Then label sentiment and theme. "
-    "Be inclusive about relevance when uncertain (false positives are better "
-    "than misses), but mark clearly-unrelated posts as about_aifp=false."
+    "social-media post, classify its scope:\n"
+    "- plan_a: explicitly about the AI 2040: Plan A publication — it names the "
+    "title, links ai-2040.com, or unmistakably discusses this specific "
+    "publication or its launch.\n"
+    "- aifp_other: genuinely about AIFP, its people, or its other work (AI "
+    "2027, the authors, their forecasts) but NOT clearly about the new "
+    "publication.\n"
+    "- unrelated: a coincidental match — the phrase used generically, a "
+    "different person with the same name, or a post about something else "
+    "entirely (e.g. a watched author praising some other lab's paper).\n"
+    "NEVER GUESS SCOPE. A post that merely COULD be about Plan A is not "
+    "plan_a — do not infer 'likely referring to Plan A' from vibes or from "
+    "who wrote it; require an explicit signal in the text or linked article. "
+    "Posts marked matched=watchlist_feed come from a watched author's feed "
+    "with NO keyword match at all: hold these to the strictest standard — "
+    "if the post does not explicitly reference AIFP or its publications, it "
+    "is unrelated, full stop. "
+    "Then label sentiment and stance toward AIFP/its work, a short theme, and "
+    "a one-sentence neutral summary. The summary must never assert a "
+    "connection to Plan A that the post does not explicitly make."
 )
 
 _INSTR = (
     'Return ONLY a JSON array. For each post return an object: '
-    '{"i": <index>, "about_aifp": true|false, '
+    '{"i": <index>, "about": "plan_a"|"aifp_other"|"unrelated", '
     '"sentiment": "positive"|"neutral"|"negative"|"mixed", '
     '"stance": "supportive"|"substantive_critique"|"dismissive"|"question"|"news_share"|"off_topic", '
     '"theme": "<3-6 word label>", "summary": "<one sentence, neutral>"}'
@@ -768,6 +786,10 @@ def ai_classify(mentions, llm_cfg):
         for start in range(0, len(items), batch):
             chunk = items[start:start + batch]
             posts = [{"i": i, "platform": m.platform, "author": m.author or m.author_name,
+                      # watchlist-feed posts carry no keyword evidence at all;
+                      # the prompt holds those to the strictest scope standard
+                      "matched": ("watchlist_feed" if (m.metrics.get("from_watchlist")
+                                                       or m.platform == "substack") else "keyword"),
                       "text": m.text[:600],
                       "article_excerpt": m.metrics.get("article_excerpt", "")[:900]}
                      for i, m in enumerate(chunk)]
@@ -790,9 +812,15 @@ def ai_classify(mentions, llm_cfg):
                 r = results.get(i)
                 if not r:
                     m.relevant, m.sentiment = True, keyword_sentiment(m)
+                    m.about = m.about or "aifp_other"
                     m.summary = m.text[:140]
                     continue
-                m.relevant = bool(r.get("about_aifp", True))
+                about = r.get("about")
+                if about not in ("plan_a", "aifp_other", "unrelated"):
+                    # legacy/degenerate answer — fall back to the old boolean
+                    about = "aifp_other" if r.get("about_aifp", True) else "unrelated"
+                m.about = about
+                m.relevant = about != "unrelated"
                 m.sentiment = r.get("sentiment", "neutral")
                 m.stance = r.get("stance", "")
                 m.theme = r.get("theme", "")
@@ -801,11 +829,13 @@ def ai_classify(mentions, llm_cfg):
     # Pass 1 — cheap, fast model over everything.
     _label(mentions, model)
 
-    # Pass 2 — re-judge only the high-stakes items (the ones that drive
-    # CRITICAL / WARNING alerts) with the stronger model, for higher fidelity.
+    # Pass 2 — re-judge the high-stakes items with the stronger model: what
+    # drives CRITICAL/WARNING alerts (negatives, critiques) plus everything
+    # from watchlist feeds, where a scope mistake pings humans directly.
     if escalate_model and escalate_model not in ("", "FILL IN"):
         escalate = [m for m in mentions if m.relevant and
-                    (m.sentiment in ("negative", "mixed") or m.stance == "substantive_critique")]
+                    (m.sentiment in ("negative", "mixed") or m.stance == "substantive_critique"
+                     or m.metrics.get("from_watchlist") or m.platform == "substack")]
         if escalate:
             print(f"  [AI] escalating {len(escalate)} item(s) to {escalate_model}.")
             _label(escalate, escalate_model, fallback=False)
@@ -1159,6 +1189,7 @@ def record_mentions(new_mentions, state_dir="."):
             "author": m.author or m.author_name,
             "sentiment": m.sentiment,
             "tier": m.tier,
+            "about": m.about or "plan_a",
             "engagement": m.engagement,
             "url": m.url,
             "summary": re.sub(r"^\[[^\]]{0,80}\]\s*", "", m.summary or m.text[:160]),
@@ -1313,10 +1344,16 @@ TIER_STYLE = {
 _TIER_ORDER = ["critical", "warning", "positive", "neutral"]
 
 
-def _individual_tier(m, watchlist):
+def _individual_tier(m, watchlist, scope="plan_a"):
     """Tier for a post that stands on its own — a watchlist author, or a post
     that cleared the attention bar (score_mentions set tier high/critical).
-    Returns None if it isn't alert-worthy alone (it still feeds the aggregates)."""
+    Returns None if it isn't alert-worthy alone (it still feeds the aggregates).
+    With alert_scope 'plan_a' (default), posts about AIFP-in-general but not
+    the publication (m.about == 'aifp_other') never page individually — a
+    Kokotajlo mention in some other story isn't launch coverage. They still
+    count in the dashboard, mention log, and narrative/surge detection."""
+    if scope == "plan_a" and m.about == "aifp_other":
+        return None
     key_figure = _watch_hit(m, watchlist) is not None or m.tier in ("critical", "high")
     if not key_figure:
         return None
@@ -1357,13 +1394,14 @@ def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
     watchlist = config.get("watchlist", [])
     responders = config.get("slack", {}).get("respond_notify", [])
     title = config.get("slack", {}).get("digest_title", "Plan A monitor")
+    scope = config.get("alert_scope", "plan_a")
 
     # 1) individual posts that alert on their own, deduped so we don't re-ping.
-    alertable = [m for m in new if _individual_tier(m, watchlist)]
+    alertable = [m for m in new if _individual_tier(m, watchlist, scope)]
     alertable = filter_unalerted(alertable, state_dir, config.get("escalate_factor", 4.0))
     by_tier = defaultdict(list)
     for m in alertable:
-        by_tier[_individual_tier(m, watchlist)].append(m)
+        by_tier[_individual_tier(m, watchlist, scope)].append(m)
 
     # 2) aggregate negativity -> WARNING (surge / narrative / small-post cluster
     #    / spike). Examples shown are the SMALL negatives; the big ones already
@@ -1447,7 +1485,7 @@ def build_tier_payloads(new, agg, spike, ratio, config, state_dir="."):
     for tier_key in _TIER_ORDER:
         if tier_key == "warning":
             if warn_reasons:
-                small = [m for m in negs if _individual_tier(m, watchlist) is None]
+                small = [m for m in negs if _individual_tier(m, watchlist, scope) is None]
                 payloads.append(_tier_payload("warning", small, warn_reasons, responders, title))
         elif by_tier.get(tier_key):
             payloads.append(_tier_payload(tier_key, by_tier[tier_key], None, responders, title))

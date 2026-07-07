@@ -70,9 +70,10 @@ function render(){
     const d=new Date(m.ts).toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'});
     if(d!==day){day=d;html+=`<div class="day">${d}</div>`;}
     const eng=m.engagement?` · ${m.engagement} engagement`:'';
+    const adj=m.about==='aifp_other'?' · <span style="color:var(--accent)">adjacent (AIFP, not Plan A)</span>':'';
     html+=`<div class="item"><span class="dot" style="background:${DOT[m.sentiment]||'var(--neu)'}"></span>
       <a href="${esc(m.url)}" target="_blank">${esc(m.summary)||esc(m.url)}</a>
-      <div class="meta">${esc(m.platform)} · ${esc(m.author)} · ${esc(m.sentiment)}${eng} ·
+      <div class="meta">${esc(m.platform)} · ${esc(m.author)} · ${esc(m.sentiment)}${eng}${adj} ·
         ${new Date(m.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div></div>`;
   }
   if(rows.length>400)html+=`<div class="empty">…and ${rows.length-400} older (use filters/search).</div>`;
