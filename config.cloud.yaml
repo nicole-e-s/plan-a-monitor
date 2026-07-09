@@ -28,6 +28,11 @@ search_terms:
 #  trip", "plan a variety show", etc. "AI 2040"/"ai-2040.com" cover the title.)
 - query: AI 2027
   precision: low
+# Accounts whose posts are ignored entirely (not fetched, not counted, never
+# alerted). Meant for bots: Grok replies to anyone who @-mentions it and its
+# 8M followers would otherwise clear the "key figure" bar on every reply.
+author_blacklist:
+- '@grok'
 context_terms:
 - AI Futures
 - Kokotajlo

@@ -179,7 +179,8 @@ def fetch_reddit(terms: list[str], since: datetime, cfg: dict, limit: int = 100)
 # X / Twitter  (X API v2 recent search — needs a paid bearer token)
 # --------------------------------------------------------------------------
 def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
-                  watchlist: list[dict] | None = None) -> list[Mention]:
+                  watchlist: list[dict] | None = None,
+                  blacklist: list[str] | None = None) -> list[Mention]:
     token = cfg.get("bearer_token", "")
     if not token or token == "FILL IN":
         print("  [X] no bearer token configured; skipping X this run.")
@@ -198,7 +199,10 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
     # NOTE: the parentheses matter — X binds AND (space) tighter than OR, so
     # without them "-is:retweet" applies ONLY to the last term and retweet
     # swarms flood in (each carrying the ORIGINAL tweet's repost count).
-    queries = [("(" + " OR ".join(f'"{t}"' for t in terms) + ") -is:retweet lang:en", False)]
+    # blacklisted bots are excluded in the query itself — no point paying
+    # per-read for Grok's reply firehose just to drop it locally
+    no_bots = "".join(f" -from:{h.lstrip('@')}" for h in (blacklist or []))
+    queries = [("(" + " OR ".join(f'"{t}"' for t in terms) + f") -is:retweet lang:en{no_bots}", False)]
     handles = [h.lstrip("@") for w in (watchlist or []) for h in w.get("handles", [])]
     chunk: list[str] = []
     for h in handles:
@@ -285,7 +289,8 @@ def fetch_all(config: dict, since: datetime) -> list[Mention]:
         # X is pay-per-use, so keep the window small (little overlap with the
         # 5-min cron) to avoid re-reading — and re-paying for — the same tweets.
         tw_since = now - timedelta(minutes=config.get("twitter_lookback_minutes", 10))
-        mentions += fetch_twitter(terms, tw_since, src["twitter"], config.get("watchlist", []))
+        mentions += fetch_twitter(terms, tw_since, src["twitter"], config.get("watchlist", []),
+                                  config.get("author_blacklist", []))
     if src.get("news", {}).get("enabled"):
         print("Fetching news…")
         # window may be stretched by run() to cover a Google News outage
@@ -603,9 +608,12 @@ def prefilter(mentions, config):
     high_terms = [t["query"].lower() for t in config["search_terms"] if t["precision"] == "high"]
     low_terms = [t["query"].lower() for t in config["search_terms"] if t["precision"] == "low"]
     context = [c.lower() for c in config.get("context_terms", [])]
+    blacklist = {h.lower().lstrip("@") for h in config.get("author_blacklist", [])}
 
     kept = []
     for m in mentions:
+        if blacklist and (m.author or "").lower().lstrip("@") in blacklist:
+            continue    # bot accounts (e.g. Grok) — never counted, never alerted
         if m.metrics.get("from_watchlist"):
             # Watchlist tweets skip the keyword gate — a subtweet never names
             # the project. The AI classifier still vets whether it's about AIFP.
