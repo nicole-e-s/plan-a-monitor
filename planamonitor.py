@@ -180,7 +180,8 @@ def fetch_reddit(terms: list[str], since: datetime, cfg: dict, limit: int = 100)
 # --------------------------------------------------------------------------
 def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
                   watchlist: list[dict] | None = None,
-                  blacklist: list[str] | None = None) -> list[Mention]:
+                  blacklist: list[str] | None = None,
+                  article_urls: list[str] | None = None) -> list[Mention]:
     token = cfg.get("bearer_token", "")
     if not token or token == "FILL IN":
         print("  [X] no bearer token configured; skipping X this run.")
@@ -202,20 +203,42 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
     # blacklisted bots are excluded in the query itself — no point paying
     # per-read for Grok's reply firehose just to drop it locally
     no_bots = "".join(f" -from:{h.lstrip('@')}" for h in (blacklist or []))
-    queries = [("(" + " OR ".join(f'"{t}"' for t in terms) + f") -is:retweet lang:en{no_bots}", False)]
+    # url:"ai-2040.com" matches the EXPANDED link in a tweet — catches shares
+    # of the site whose visible text never names the project (t.co wrapping
+    # hides the URL from plain text search).
+    queries = [("(" + " OR ".join(f'"{t}"' for t in terms)
+                + ' OR url:"ai-2040.com"' + f") -is:retweet lang:en{no_bots}", "kw")]
     handles = [h.lstrip("@") for w in (watchlist or []) for h in w.get("handles", [])]
     chunk: list[str] = []
     for h in handles:
         if chunk and sum(len(x) + 9 for x in chunk) + len(h) + 9 > 480:
-            queries.append(("(" + " OR ".join(f"from:{x}" for x in chunk) + ") -is:retweet", True))
+            queries.append(("(" + " OR ".join(f"from:{x}" for x in chunk) + ") -is:retweet", "watch"))
             chunk = []
         chunk.append(h)
     if chunk:
-        queries.append(("(" + " OR ".join(f"from:{x}" for x in chunk) + ") -is:retweet", True))
+        queries.append(("(" + " OR ".join(f"from:{x}" for x in chunk) + ") -is:retweet", "watch"))
+
+    # Queries N+: tweets LINKING to articles we already know are about us —
+    # catches the keyword-less "this is wild <link>" shares and quote-posts
+    # that only surface on trend pages. URLs come from our own news mentions.
+    link_chunk: list[str] = []
+    def _flush_links():
+        if link_chunk:
+            queries.append(("(" + " OR ".join(f'url:"{u}"' for u in link_chunk)
+                            + f") -is:retweet{no_bots}", "link"))
+            link_chunk.clear()
+    for u in (article_urls or [])[:8]:
+        u = re.sub(r"^https?://(www\.)?", "", u.split("?")[0].split("#")[0]).rstrip("/")
+        if not u:
+            continue
+        if link_chunk and sum(len(x) + 9 for x in link_chunk) + len(u) + 9 > 450:
+            _flush_links()
+        link_chunk.append(u)
+    _flush_links()
 
     out: list[Mention] = []
-    got: set[str] = set()          # same tweet can match both query types
-    for query, is_watch in queries:
+    got: set[str] = set()          # same tweet can match several query types
+    for query, kind in queries:
         params = urllib.parse.urlencode({
             "query": query,
             "max_results": min(max(max_results, 10), 100),
@@ -263,7 +286,8 @@ def fetch_twitter(terms: list[str], since: datetime, cfg: dict,
                 metrics={"likes": pm.get("like_count", 0), "reposts": pm.get("retweet_count", 0),
                          "quotes": pm.get("quote_count", 0), "replies": pm.get("reply_count", 0),
                          "impressions": pm.get("impression_count", 0),
-                         "from_watchlist": is_watch},
+                         "from_watchlist": kind == "watch",
+                         "matched_link": kind == "link"},
             ))
         time.sleep(0.2)
     return out
@@ -289,8 +313,21 @@ def fetch_all(config: dict, since: datetime) -> list[Mention]:
         # X is pay-per-use, so keep the window small (little overlap with the
         # 5-min cron) to avoid re-reading — and re-paying for — the same tweets.
         tw_since = now - timedelta(minutes=config.get("twitter_lookback_minutes", 10))
+        # tweets that share our recent press coverage carry no keywords —
+        # find them by the article LINK (url: operator, expanded-URL match)
+        article_urls = []
+        if src["twitter"].get("track_article_shares", True):
+            cutoff = (now - timedelta(hours=48)).isoformat()
+            seen_u = set()
+            for e in reversed(_load(os.path.join(".", _MENTIONS), [])):
+                if e.get("platform") == "news" and e.get("ts", "") >= cutoff \
+                   and e.get("url") and e["url"] not in seen_u:
+                    seen_u.add(e["url"])
+                    article_urls.append(e["url"])
+                if len(article_urls) >= 8:
+                    break
         mentions += fetch_twitter(terms, tw_since, src["twitter"], config.get("watchlist", []),
-                                  config.get("author_blacklist", []))
+                                  config.get("author_blacklist", []), article_urls)
     if src.get("news", {}).get("enabled"):
         print("Fetching news…")
         # window may be stretched by run() to cover a Google News outage
@@ -614,9 +651,10 @@ def prefilter(mentions, config):
     for m in mentions:
         if blacklist and (m.author or "").lower().lstrip("@") in blacklist:
             continue    # bot accounts (e.g. Grok) — never counted, never alerted
-        if m.metrics.get("from_watchlist"):
-            # Watchlist tweets skip the keyword gate — a subtweet never names
-            # the project. The AI classifier still vets whether it's about AIFP.
+        if m.metrics.get("from_watchlist") or m.metrics.get("matched_link"):
+            # Watchlist tweets and article-link shares skip the keyword gate —
+            # a subtweet never names the project, and a "this is wild <link>"
+            # share has no keywords either. The AI still vets scope.
             m.confidence = "medium"
             kept.append(m)
             continue
@@ -728,6 +766,9 @@ _SYSTEM = (
     "with NO keyword match: these need an explicit AIFP reference to be "
     "anything but unrelated. If you cannot tell what such a post refers to, "
     "use aifp_other with scope_confidence low — never plan_a.\n"
+    "- Posts marked matched=article_link share a link to a press article "
+    "already identified as AIFP coverage — the link itself is the evidence, "
+    "so judge scope and sentiment from how the poster frames it.\n"
     "Then label sentiment and stance toward AIFP/its work, a short theme, and "
     "a one-sentence neutral summary. The summary must never assert a "
     "connection to Plan A that the post does not explicitly make."
@@ -821,9 +862,13 @@ def ai_classify(mentions, llm_cfg):
             chunk = items[start:start + batch]
             posts = [{"i": i, "platform": m.platform, "author": m.author or m.author_name,
                       # watchlist-feed posts carry no keyword evidence at all;
-                      # the prompt holds those to the strictest scope standard
+                      # the prompt holds those to the strictest scope standard.
+                      # article_link posts share a known-relevant article — the
+                      # link itself is the evidence.
                       "matched": ("watchlist_feed" if (m.metrics.get("from_watchlist")
-                                                       or m.platform == "substack") else "keyword"),
+                                                       or m.platform == "substack")
+                                  else "article_link" if m.metrics.get("matched_link")
+                                  else "keyword"),
                       "text": m.text[:600],
                       "article_excerpt": m.metrics.get("article_excerpt", "")[:900]}
                      for i, m in enumerate(chunk)]

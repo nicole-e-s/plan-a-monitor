@@ -209,6 +209,10 @@ sources:
     enabled: false
     bearer_token: FILL IN
     max_results: 100
+    # Also search X for tweets LINKING to our recent press coverage (the
+    # article URLs come from our own news mentions) — catches keyword-less
+    # "this is wild <link>" shares that only surface on trend pages:
+    track_article_shares: true
   news:
     enabled: true
     min_tier: 2
