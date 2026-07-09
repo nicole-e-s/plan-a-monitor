@@ -392,10 +392,17 @@ def fetch_news(terms, since, cfg, state_dir=".") -> list[Mention]:
             time.sleep(5 * (attempt + 1))
     if last_err:
         _note_error(f"[News] fetch error after 3 tries: {last_err}")
-    # de-dupe identical links, keep within time window
+    # De-dupe identical links. Accept anything published within the pickup
+    # window, NOT just since the last pull: Google News often surfaces an
+    # article in search HOURS after its pubDate, and a strict last-hour date
+    # filter permanently missed those late-indexed stories (the Axios miss,
+    # 2026-07-09). Re-processing is idempotent: clusters absorb repeats and
+    # emitted_tier stops re-emission.
+    now = datetime.now(timezone.utc)
+    date_floor = min(since, now - timedelta(hours=float(cfg.get("pickup_window_hours", 72))))
     seen_links, articles = set(), []
     for a in raw:
-        if a["link"] in seen_links or a["date"] < since:
+        if a["link"] in seen_links or a["date"] < date_floor:
             continue
         seen_links.add(a["link"])
         a["norm"] = _norm_title(a["title"])
@@ -407,7 +414,6 @@ def fetch_news(terms, since, cfg, state_dir=".") -> list[Mention]:
     # one window meant "5 outlets in an hour", which only wire-service bursts
     # ever satisfied; organic pickup restarted from zero every pull.
     path = os.path.join(state_dir, _NEWS_CLUSTERS)
-    now = datetime.now(timezone.utc)
     horizon = now - timedelta(hours=float(cfg.get("pickup_window_hours", 72)))
     clusters = []
     for c in _load(path, []):
@@ -603,6 +609,15 @@ def prefilter(mentions, config):
         if m.metrics.get("from_watchlist"):
             # Watchlist tweets skip the keyword gate — a subtweet never names
             # the project. The AI classifier still vets whether it's about AIFP.
+            m.confidence = "medium"
+            kept.append(m)
+            continue
+        if m.platform in ("news", "substack"):
+            # News stories already passed the outlet/pickup gate, and substack
+            # items come from watchlist feeds. Their TITLES often carry no
+            # keyword ("He warned AI could lead to extinction..." — the WaPo
+            # miss, 2026-07-09); the AI fetches the article body and judges
+            # scope, so never keyword-drop these on the headline.
             m.confidence = "medium"
             kept.append(m)
             continue
