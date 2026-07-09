@@ -771,7 +771,18 @@ _SYSTEM = (
     "so judge scope and sentiment from how the poster frames it.\n"
     "Then label sentiment and stance toward AIFP/its work, a short theme, and "
     "a one-sentence neutral summary. The summary must never assert a "
-    "connection to Plan A that the post does not explicitly make."
+    "connection to Plan A that the post does not explicitly make.\n"
+    "Sentiment rules — sentiment measures the post's attitude TOWARD AIFP and "
+    "its work, not the post's general mood:\n"
+    "- Mockery, satire, or dunking on the forecasts is negative even when "
+    "playful or funny.\n"
+    "- Sharing a link or reporting facts without commentary is neutral, even "
+    "if the underlying news is bad.\n"
+    "- Worry about AI risk in general is NOT negative toward AIFP; it is only "
+    "negative if aimed at AIFP, its people, or its publications.\n"
+    "- Praise of the work, endorsement, or 'must-read' framing is positive.\n"
+    "If recent human corrections are listed in the prompt, treat them as "
+    "precedents and follow them for similar posts."
 )
 
 _INSTR = (
@@ -785,12 +796,18 @@ _INSTR = (
 
 
 def _anthropic_call(api_key, model, prompt):
-    body = json.dumps({
+    payload = {
         "model": model,
-        "max_tokens": 2000,
+        # generous cap: adaptive thinking spends output tokens before the JSON
+        "max_tokens": 8000,
         "system": _SYSTEM,
         "messages": [{"role": "user", "content": prompt}],
-    }).encode()
+    }
+    if not model.startswith("claude-haiku"):
+        # Sonnet 5 / Opus 4.8: adaptive thinking helps the sarcasm/satire
+        # sentiment calls; Haiku 4.5 doesn't accept it
+        payload["thinking"] = {"type": "adaptive"}
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages", data=body,
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
@@ -856,6 +873,14 @@ def ai_classify(mentions, llm_cfg):
                 if body:
                     m.metrics["article_excerpt"] = body[:1200]
 
+    # Human re-tags become precedents the model sees (see apply_retags)
+    _ex = _load(os.path.join(".", _RETAG), {}).get("examples", [])
+    _fewshot = ""
+    if _ex:
+        _fewshot = ("\nRecent human corrections — follow these precedents for similar posts:\n"
+                    + "\n".join(f'- "{c.get("summary", "")}" -> about={c.get("about") or "?"}, '
+                                f'sentiment={c.get("sentiment")}' for c in _ex[-6:]) + "\n")
+
     def _label(items, use_model, fallback=True):
         """Classify a list of mentions in batches with the given model."""
         for start in range(0, len(items), batch):
@@ -872,7 +897,7 @@ def ai_classify(mentions, llm_cfg):
                       "text": m.text[:600],
                       "article_excerpt": m.metrics.get("article_excerpt", "")[:900]}
                      for i, m in enumerate(chunk)]
-            prompt = (f"{_INSTR}\n\nPosts:\n{json.dumps(posts, ensure_ascii=False)}")
+            prompt = (f"{_INSTR}\n{_fewshot}\nPosts:\n{json.dumps(posts, ensure_ascii=False)}")
             try:
                 raw = (_anthropic_call if provider == "anthropic" else _openai_call)(api_key, use_model, prompt)
                 results = {r["i"]: r for r in _extract_json(raw)}
@@ -1159,6 +1184,7 @@ _DIGEST = "digest_state.json"    # last daily-digest date
 _HEALTH = "health_state.json"    # last health-ping signature (repeat suppression)
 _MENTIONS = "mentions.json"      # running log of every relevant mention (public)
 _NEWS_CLUSTERS = "news_clusters.json"  # cross-run story clusters (pickup accumulates over days)
+_RETAG = "retag_state.json"      # applied human re-tags + precedent examples for the classifier
 
 
 def _load(path, default):
@@ -1294,6 +1320,77 @@ def record_mentions(new_mentions, state_dir="."):
     log = log[-3000:]
     with open(path, "w") as f:
         json.dump(log, f)
+
+
+def apply_retags(config, state_dir="."):
+    """Pull human re-tags from the published Google Sheet CSV (fed by the
+    'fix tag' form linked from mentions.html) and apply them to the mention
+    log. Recent corrections are also kept as precedent examples that get
+    shown to the classifier, so re-tagging teaches it."""
+    url = config.get("retag", {}).get("sheet_csv_url", "")
+    if not url or "PASTE" in url:
+        return
+    import csv as _csv, io as _io, hashlib as _hashlib
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "plan-a-monitor/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            rows = list(_csv.reader(_io.StringIO(r.read().decode("utf-8", "ignore"))))
+    except Exception as e:
+        print(f"  [retag] sheet fetch failed: {e}")
+        return
+    if len(rows) < 2:
+        return
+    header = [h.strip().lower() for h in rows[0]]
+
+    def col(*words):
+        for i, h in enumerate(header):
+            if any(w in h for w in words):
+                return i
+        return None
+
+    c_url, c_sent, c_scope = col("url", "link"), col("sentiment"), col("scope", "about")
+    if c_url is None:
+        print("  [retag] no URL column in the sheet — check the form's questions.")
+        return
+    state = _load(os.path.join(state_dir, _RETAG), {"done": [], "examples": []})
+    mlog = _load(os.path.join(state_dir, _MENTIONS), [])
+    sent_words = ("positive", "neutral", "negative", "mixed")
+    scope_map = {"unrelated": "unrelated", "adjacent": "aifp_other", "aifp": "aifp_other",
+                 "plan": "plan_a"}
+    changed = 0
+    for row in rows[1:]:
+        if not row:
+            continue
+        rid = _hashlib.sha1("|".join(row).encode()).hexdigest()[:16]
+        if rid in state["done"]:
+            continue
+        state["done"].append(rid)
+        target = row[c_url].strip() if c_url < len(row) else ""
+        cell = lambda c: row[c].lower() if (c is not None and c < len(row)) else ""
+        new_sent = next((w for w in sent_words if w in cell(c_sent)), None)
+        new_scope = next((v for k, v in scope_map.items() if k in cell(c_scope)), None)
+        if not target or (not new_sent and not new_scope):
+            continue
+        for e in mlog:
+            if e.get("url") == target:
+                if new_sent:
+                    e["sentiment"] = new_sent
+                if new_scope:
+                    e["about"] = new_scope
+                e["corrected"] = True
+                state["examples"].append({"summary": (e.get("summary") or "")[:120],
+                                          "sentiment": e["sentiment"],
+                                          "about": e.get("about", "")})
+                changed += 1
+                break
+    state["done"] = state["done"][-2000:]
+    state["examples"] = state["examples"][-10:]
+    with open(os.path.join(state_dir, _RETAG), "w") as f:
+        json.dump(state, f)
+    if changed:
+        with open(os.path.join(state_dir, _MENTIONS), "w") as f:
+            json.dump(mlog, f)
+        print(f"  [retag] applied {changed} human correction(s).")
 
 
 def filter_unalerted(individual, state_dir=".", escalate_factor=4.0):
@@ -1740,6 +1837,10 @@ def run(config, dry_run=False, mentions=None, state_dir="."):
         _note_error("watchlist is EMPTY — WATCHLIST_YAML secret missing/unset? Watchlist alerts are OFF.")
     if not config.get("sources", {}).get("twitter", {}).get("enabled"):
         _note_error("X/Twitter is OFF — X_BEARER_TOKEN secret missing? It's the most important source.")
+    try:
+        apply_retags(config, state_dir)
+    except Exception as e:
+        print(f"  [retag] failed: {e}")
     now = datetime.now(timezone.utc)
     # GitHub's cron is best-effort: gaps of 2-3 HOURS between scheduled runs
     # have been observed. If the last run was longer ago than the configured

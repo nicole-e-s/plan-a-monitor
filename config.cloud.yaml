@@ -262,13 +262,24 @@ llm:
   enabled: true
   provider: anthropic
   api_key: ''
-  # Cheap/fast model for the bulk relevance + sentiment pass:
-  model: claude-haiku-4-5-20251001
-  # Higher-fidelity model used ONLY to re-judge high-stakes items (negative /
-  # mixed sentiment or substantive critiques) — the posts that drive CRITICAL /
-  # WARNING alerts. Leave blank ('') to turn the second pass off.
-  escalate_model: claude-sonnet-5
+  # Model for the bulk relevance + sentiment pass (upgraded from Haiku 4.5
+  # on 2026-07-10 after sentiment-quality complaints):
+  model: claude-sonnet-5
+  # Strongest model, used to re-judge high-stakes items (negatives, critiques,
+  # watchlist posts, low-confidence calls) — the posts that page humans.
+  # Leave blank ('') to turn the second pass off.
+  escalate_model: claude-opus-4-8
   batch_size: 15
+# --- human re-tagging (USER-MANUAL.md "Fixing a wrong tag") ---
+# A Google Form + linked Sheet lets anyone on comms correct a wrong sentiment
+# or scope tag from the mention log. Setup: create the form (questions:
+# Mention URL / Correct sentiment / Correct scope), link responses to a
+# Sheet, publish that sheet to the web as CSV, then paste the three values.
+# Leave the PASTE placeholders to keep the feature off.
+retag:
+  form_url: PASTE_GOOGLE_FORM_VIEWFORM_URL
+  url_entry: PASTE_ENTRY_ID_FOR_URL_FIELD   # looks like entry.123456789
+  sheet_csv_url: PASTE_PUBLISHED_CSV_URL
 mode: alerts
 slack:
   webhook_url: ''

@@ -51,14 +51,16 @@
 // Data comes from the repo directly (raw.githubusercontent.com), same as the
 // dashboard, so it's fresh without waiting on a GitHub Pages build.
 const RAW='https://raw.githubusercontent.com/nicole-e-s/plan-a-monitor/main/mentions.json';
+const CFG='https://raw.githubusercontent.com/nicole-e-s/plan-a-monitor/main/config.cloud.yaml';
 const DOT={positive:'var(--pos)',negative:'var(--neg)',mixed:'var(--neg)',neutral:'var(--neu)',unknown:'var(--neu)'};
-let all=[], sent='all';
+let all=[], sent='all', retag=null;   // retag = {form, entry} once loaded from config
 const esc=s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 
 function render(){
   const plat=document.getElementById('plat').value;
   const q=document.getElementById('q').value.trim().toLowerCase();
   let rows=all.filter(m=>
+    m.about!=='unrelated'&&   // human-retagged as unrelated -> hidden
     (sent==='all'||m.sentiment===sent||(sent==='negative'&&m.sentiment==='mixed'))&&
     (plat==='all'||m.platform===plat)&&
     (!q||(m.summary||'').toLowerCase().includes(q)||(m.author||'').toLowerCase().includes(q)));
@@ -71,16 +73,25 @@ function render(){
     if(d!==day){day=d;html+=`<div class="day">${d}</div>`;}
     const eng=m.engagement?` · ${m.engagement} engagement`:'';
     const adj=m.about==='aifp_other'?' · <span style="color:var(--accent)">adjacent (AIFP, not Plan A)</span>':'';
+    const cor=m.corrected?' · <span title="tag corrected by a human">✓ corrected</span>':'';
+    const fix=retag?` · <a href="${retag.form}?usp=pp_url&${retag.entry}=${encodeURIComponent(m.url)}" target="_blank">fix tag</a>`:'';
     html+=`<div class="item"><span class="dot" style="background:${DOT[m.sentiment]||'var(--neu)'}"></span>
       <a href="${esc(m.url)}" target="_blank">${esc(m.summary)||esc(m.url)}</a>
-      <div class="meta">${esc(m.platform)} · ${esc(m.author)} · ${esc(m.sentiment)}${eng}${adj} ·
-        ${new Date(m.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div></div>`;
+      <div class="meta">${esc(m.platform)} · ${esc(m.author)} · ${esc(m.sentiment)}${eng}${adj}${cor} ·
+        ${new Date(m.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}${fix}</div></div>`;
   }
   if(rows.length>400)html+=`<div class="empty">…and ${rows.length-400} older (use filters/search).</div>`;
   document.getElementById('list').innerHTML=html;
 }
 
 async function load(){
+  if(retag===null){
+    try{   // the fix-tag form URL lives in the public config
+      const t=await (await fetch(CFG+'?_='+Date.now(),{cache:'no-store'})).text();
+      const f=(t.match(/form_url:\s*(\S+)/)||[])[1], e=(t.match(/url_entry:\s*(\S+)/)||[])[1];
+      retag=(f&&e&&!f.includes('PASTE')&&!e.includes('PASTE'))?{form:f,entry:e}:false;
+    }catch(err){retag=false;}
+  }
   try{
     let r=await fetch(RAW+'?_='+Date.now(),{cache:'no-store'});
     if(!r.ok) r=await fetch('mentions.json?_='+Date.now());
