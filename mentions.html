@@ -74,15 +74,16 @@ function render(){
     if(d!==day){day=d;html+=`<div class="day">${d}</div>`;}
     const eng=m.engagement?` · ${m.engagement} engagement`:'';
     const adj=m.about==='aifp_other'?' · <span style="color:var(--accent)">adjacent (AIFP, not Plan A)</span>':'';
-    const cor=m.corrected?' · <span title="tag corrected by a human">✓ corrected</span>':'';
-    const fix=retag?` · <a href="#" onclick="return fixUI(${i})">fix tag</a><span id="fix-${i}" style="display:none"> → tag as:
+    const cor=m.corrected==='local'?' · <span title="visible only in this browser">✓ corrected (this browser)</span>'
+             :m.corrected?' · <span title="tag corrected by a human">✓ corrected</span>':'';
+    const fix=` · <a href="#" onclick="return fixUI(${i})">fix tag</a><span id="fix-${i}" style="display:none"> → tag as:
         <button class="btn" title="positive" onclick="sendRetag(${i},'sentiment','positive')">🟢</button>
         <button class="btn" title="neutral" onclick="sendRetag(${i},'sentiment','neutral')">⚪</button>
         <button class="btn" title="negative" onclick="sendRetag(${i},'sentiment','negative')">🔴</button>
         <button class="btn" title="mixed" onclick="sendRetag(${i},'sentiment','mixed')">🟡</button>
         <button class="btn" onclick="sendRetag(${i},'scope','plan_a')">Plan A</button>
         <button class="btn" onclick="sendRetag(${i},'scope','aifp_other')">Adjacent</button>
-        <button class="btn" onclick="sendRetag(${i},'scope','unrelated')">Unrelated</button></span>`:'';
+        <button class="btn" onclick="sendRetag(${i},'scope','unrelated')">Unrelated</button></span>`;
     html+=`<div class="item"><span class="dot" style="background:${DOT[m.sentiment]||'var(--neu)'}"></span>
       <a href="${esc(m.url)}" target="_blank">${esc(m.summary)||esc(m.url)}</a>
       <div class="meta">${esc(m.platform)} · ${esc(m.author)} · ${esc(m.sentiment)}${eng}${adj}${cor} ·
@@ -104,6 +105,7 @@ async function load(){
     let r=await fetch(RAW+'?_='+Date.now(),{cache:'no-store'});
     if(!r.ok) r=await fetch('mentions.json?_='+Date.now());
     all=await r.json();
+    if(!retag||!retag.post) applyLocal(all);
   }catch(e){
     try{const r=await fetch('mentions.json?_='+Date.now()); all=await r.json();}
     catch(e2){document.getElementById('status').textContent='no mention log yet';
@@ -120,6 +122,15 @@ function fixUI(i){
   return false;
 }
 async function sendRetag(i, field, value){
+  const el=document.getElementById('fix-'+i);
+  if(!retag||!retag.post){
+    // no shared endpoint configured: save the correction in THIS browser only
+    const local=JSON.parse(localStorage.getItem('retagLocal')||'{}');
+    local[_rows[i].url]=Object.assign(local[_rows[i].url]||{}, {[field]:value});
+    localStorage.setItem('retagLocal', JSON.stringify(local));
+    render();
+    return;
+  }
   let key=localStorage.getItem('retagKey');
   if(!key){
     key=prompt('Team password for re-tagging (ask the operator):');
@@ -134,8 +145,18 @@ async function sendRetag(i, field, value){
     await fetch(retag.post,{method:'POST',mode:'no-cors',
       headers:{'Content-Type':'text/plain'},body:JSON.stringify(body)});
   }catch(e){}
-  const el=document.getElementById('fix-'+i);
   if(el) el.outerHTML=' <span>✓ queued — applies within ~5 min</span>';
+}
+function applyLocal(list){
+  // overlay this browser's own corrections (used when no shared endpoint)
+  const local=JSON.parse(localStorage.getItem('retagLocal')||'{}');
+  for(const m of list){
+    const c=local[m.url];
+    if(!c) continue;
+    if(c.sentiment) m.sentiment=c.sentiment;
+    if(c.scope) m.about=c.scope;
+    m.corrected='local';
+  }
 }
 document.querySelectorAll('.controls .btn').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.controls .btn').forEach(x=>x.classList.remove('on'));
