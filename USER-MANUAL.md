@@ -72,10 +72,11 @@ The list of people we watch is deliberately not in this repository, because the 
 
 If a mention in the [mention log](https://nicole-e-s.github.io/plan-a-monitor/mentions.html) has the wrong sentiment, or isn't really about us at all:
 
-1. Click **fix tag** next to the mention. A short form opens with the mention's link already filled in.
-2. Pick the correct sentiment and/or scope, then Submit.
+1. Click **fix tag** next to the mention — a row of tag buttons appears right there.
+2. Click the correct one: 🟢 🟡 ⚪ 🔴 for sentiment, or Plan A / Adjacent / Unrelated for scope.
+3. The first time only, it asks for the team password — ask the operator.
 
-Within about 5 minutes the mention log updates (a "✓ corrected" mark appears), and the classifier is shown recent corrections as precedents, so it learns from them. Two limits worth knowing: the history chart doesn't retroactively change, and a correction doesn't un-send any Slack alert that already fired.
+That's it — "✓ queued" appears, and within about 5 minutes the log updates with a "✓ corrected" mark. The classifier is shown recent corrections as precedents, so it learns from them. Two limits worth knowing: the history chart doesn't retroactively change, and a correction doesn't un-send a Slack alert that already fired.
 
 ## FAQ
 

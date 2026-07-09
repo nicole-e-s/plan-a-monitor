@@ -271,14 +271,14 @@ llm:
   escalate_model: claude-opus-4-8
   batch_size: 15
 # --- human re-tagging (USER-MANUAL.md "Fixing a wrong tag") ---
-# A Google Form + linked Sheet lets anyone on comms correct a wrong sentiment
-# or scope tag from the mention log. Setup: create the form (questions:
-# Mention URL / Correct sentiment / Correct scope), link responses to a
-# Sheet, publish that sheet to the web as CSV, then paste the three values.
-# Leave the PASTE placeholders to keep the feature off.
+# One-click tag buttons on the mention log page, backed by a Google Sheet.
+# Setup (once): make a Google Sheet -> Extensions -> Apps Script -> paste
+# retag-appsscript.gs from this repo (set the team password inside) ->
+# Deploy -> Web app (execute as Me, access: Anyone) -> paste that URL as
+# post_url. Then File -> Share -> Publish to web -> the "retags" tab as CSV
+# -> paste as sheet_csv_url. PASTE placeholders keep the feature off.
 retag:
-  form_url: PASTE_GOOGLE_FORM_VIEWFORM_URL
-  url_entry: PASTE_ENTRY_ID_FOR_URL_FIELD   # looks like entry.123456789
+  post_url: PASTE_APPS_SCRIPT_WEB_APP_URL
   sheet_csv_url: PASTE_PUBLISHED_CSV_URL
 mode: alerts
 slack:
