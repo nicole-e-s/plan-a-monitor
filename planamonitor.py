@@ -92,10 +92,19 @@ def fetch_hackernews(terms: list[str], since: datetime, limit: int = 100) -> lis
         url = (f"https://hn.algolia.com/api/v1/search_by_date?query={q}&advancedSyntax=true"
                f"&tags=(story,comment)&numericFilters=created_at_i>{since_ts}"
                f"&hitsPerPage={limit}")
-        try:
-            data = _get_json(url)
-        except Exception as e:
-            _note_error(f"[HN] fetch error for '{term}': {e}")
+        # Algolia occasionally drops connections from GitHub runner IPs
+        # (Errno 104) — transient, so retry before declaring the term failed.
+        data = None
+        for attempt in range(3):
+            try:
+                data = _get_json(url)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(3 * (attempt + 1))
+                else:
+                    _note_error(f"[HN] fetch error for '{term}': {e}")
+        if data is None:
             continue
         for h in data.get("hits", []):
             is_comment = h.get("comment_text") is not None
@@ -808,12 +817,26 @@ def _anthropic_call(api_key, model, prompt):
         # sentiment calls; Haiku 4.5 doesn't accept it
         payload["thinking"] = {"type": "adaptive"}
     body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=body,
-        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        data = json.load(r)
+    for attempt in range(3):
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages", data=body,
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            # 529 = Anthropic overloaded, 429 = rate limit, 5xx = server blip:
+            # all transient. Anything else (bad model id, bad key) is permanent
+            # and retrying would just delay the real error.
+            if e.code not in (429, 500, 502, 503, 504, 529) or attempt == 2:
+                raise
+            time.sleep(10 * (attempt + 1))
+        except OSError:   # connection reset / timeout
+            if attempt == 2:
+                raise
+            time.sleep(10 * (attempt + 1))
     # concatenate the text blocks — content[0] isn't guaranteed to be text
     # (e.g. a thinking block comes first on some models)
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
@@ -835,8 +858,27 @@ def _openai_call(api_key, model, prompt):
 
 
 def _extract_json(text):
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    return json.loads(m.group(0)) if m else []
+    start = text.find("[")
+    if start < 0:
+        return []
+    s = text[start:]
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # tolerate prose after the array ("...]  Hope that helps!")
+    m = re.search(r"\[.*\]", s, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+    # truncated or garbled tail: salvage the complete leading objects so a
+    # one-character glitch doesn't throw away the whole batch's labels
+    last = s.rfind("}")
+    if last > 0:
+        return json.loads(s[:last + 1] + "]")
+    raise json.JSONDecodeError("no parseable JSON array in reply", s, 0)
 
 
 def fetch_article_text(url, limit=2000):
@@ -898,19 +940,27 @@ def ai_classify(mentions, llm_cfg):
                       "article_excerpt": m.metrics.get("article_excerpt", "")[:900]}
                      for i, m in enumerate(chunk)]
             prompt = (f"{_INSTR}\n{_fewshot}\nPosts:\n{json.dumps(posts, ensure_ascii=False)}")
-            try:
-                raw = (_anthropic_call if provider == "anthropic" else _openai_call)(api_key, use_model, prompt)
-                results = {r["i"]: r for r in _extract_json(raw)}
-            except Exception as e:
-                if fallback:
-                    _note_error(f"[AI] batch failed on model '{use_model}' ({e}); "
-                                f"keyword fallback for {len(chunk)} item(s).")
-                    keyword_fallback(chunk)
-                else:
-                    # escalation pass: on failure KEEP the first-pass labels —
-                    # never downgrade an already-classified item to keywords
-                    _note_error(f"[AI] escalation failed on '{use_model}' ({e}); "
-                                f"keeping first-pass labels for {len(chunk)} item(s).")
+            results = None
+            for attempt in range(2):
+                try:
+                    raw = (_anthropic_call if provider == "anthropic" else _openai_call)(api_key, use_model, prompt)
+                    results = {r["i"]: r for r in _extract_json(raw)}
+                    break
+                except Exception as e:
+                    # a malformed-JSON reply is a bad sample, not a broken API —
+                    # one fresh attempt usually parses; then fall back
+                    if attempt == 0:
+                        continue
+                    if fallback:
+                        _note_error(f"[AI] batch failed on model '{use_model}' ({e}); "
+                                    f"keyword fallback for {len(chunk)} item(s).")
+                        keyword_fallback(chunk)
+                    else:
+                        # escalation pass: on failure KEEP the first-pass labels —
+                        # never downgrade an already-classified item to keywords
+                        _note_error(f"[AI] escalation failed on '{use_model}' ({e}); "
+                                    f"keeping first-pass labels for {len(chunk)} item(s).")
+            if results is None:
                 continue
             for i, m in enumerate(chunk):
                 r = results.get(i)
