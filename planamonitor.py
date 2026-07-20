@@ -1039,7 +1039,11 @@ def _watch_hit(m, watchlist):
         handles = [h.lower().lstrip("@") for h in w.get("handles", [])]
         if a and a in handles:
             return w
-        if w["name"].lower() in name or (name and name in w["name"].lower()):
+        # Display-name match requires the FULL watchlist name on word
+        # boundaries (catches "Michael Kratsios 🇺🇸", not a random account
+        # whose display name is a fragment like "t" — that substring match
+        # paged the team about a 2-impression tweet on 2026-07-20).
+        if name and re.search(r"\b" + re.escape(w["name"].lower()) + r"\b", name):
             return w
     return None
 
