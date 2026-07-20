@@ -27,6 +27,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Sync to branch tip
+        # checkout pins the commit SHA snapshotted when the run was QUEUED.
+        # A run queued while another was still executing (pinger + cron
+        # overlap) starts WITHOUT the previous run's alerted.json and
+        # re-pings the same post (duplicate alerts on 2026-07-20). Pull the
+        # real tip first; if that fails, run from the snapshot as before.
+        run: git pull --ff-only origin main || echo "::warning::could not sync to branch tip; running from queued snapshot"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -57,12 +64,20 @@ jobs:
           else
             git commit -m "monitor state $(date -u +%FT%TZ)"
             # two near-simultaneous runs (pinger + manual click) can race on
-            # this push; losing the race just drops one 5-min data point,
-            # which the monitor's gap-widening recovers — warn, don't fail
-            if git pull --rebase --autostash && git push; then
-              echo "state pushed"
-            else
+            # this push. Dropping the commit is NOT harmless — it carries
+            # alerted.json, and losing that re-pings the same post next run
+            # (the 2026-07-20 duplicate). Retry the rebase+push; on conflict
+            # keep OUR side (-X theirs replays our commit's version, and our
+            # commit only touches state files this run just computed).
+            pushed=""
+            for i in 1 2 3; do
+              if git pull --rebase --autostash -X theirs && git push; then
+                pushed=yes; echo "state pushed"; break
+              fi
               git rebase --abort 2>/dev/null || true
-              echo "::warning::state push lost a race with a concurrent run; next run re-records"
+              sleep 3
+            done
+            if [ -z "$pushed" ]; then
+              echo "::warning::state push failed after 3 attempts; this run's alert-dedup state is lost"
             fi
           fi
