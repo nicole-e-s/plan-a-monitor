@@ -831,7 +831,15 @@ def _anthropic_call(api_key, model, prompt):
             # all transient. Anything else (bad model id, bad key) is permanent
             # and retrying would just delay the real error.
             if e.code not in (429, 500, 502, 503, 504, 529) or attempt == 2:
-                raise
+                # surface the API's own error message — "HTTP Error 400: Bad
+                # Request" alone can't distinguish a bad parameter from an
+                # exhausted credit balance or an oversized prompt
+                try:
+                    detail = json.loads(e.read().decode("utf-8", "ignore"))["error"]["message"]
+                except Exception:
+                    detail = ""
+                msg = f"{e.reason} — {detail[:300]}" if detail else e.reason
+                raise urllib.error.HTTPError(e.url, e.code, msg, e.headers, None) from None
             time.sleep(10 * (attempt + 1))
         except OSError:   # connection reset / timeout
             if attempt == 2:
