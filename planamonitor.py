@@ -912,6 +912,32 @@ def ai_classify(mentions, llm_cfg):
     batch = int(llm_cfg.get("batch_size", 15))
     get_article = llm_cfg.get("fetch_article_text", True)
 
+    # Label cache. Fetch windows roll, so the same post keeps being fetched
+    # for hours/days after it appears — classification runs BEFORE the
+    # seen-ids dedup (aggregate counting needs labels on old posts too), so
+    # without a cache every 5-minute run re-bought the same Sonnet+Opus
+    # labels (~288x/day; this is what drained the API credits in July).
+    # Only genuine AI labels are cached — keyword-fallback labels from an
+    # outage are not, so those posts get real labels once the API is back.
+    cache_path = os.path.join(".", _AI_LABELS)
+    cache = _load(cache_path, {})
+    todo = []
+    for m in mentions:
+        c = cache.get(f"{m.platform}:{m.id}")
+        if c:
+            m.about = c.get("about") or "aifp_other"
+            m.about_conf = c.get("about_conf") or "medium"
+            m.relevant = m.about != "unrelated"
+            m.sentiment = c.get("sentiment", "neutral")
+            m.stance = c.get("stance", "")
+            m.theme = c.get("theme", "")
+            m.summary = c.get("summary", "")
+        else:
+            todo.append(m)
+    if len(mentions) - len(todo):
+        print(f"  [AI] {len(mentions) - len(todo)} item(s) from label cache; "
+              f"{len(todo)} to classify.")
+
     # For news + HN link-submissions, pull the article body so relevance and
     # sentiment are based on the real content (fixes headline-only ambiguity).
     if get_article:
@@ -989,17 +1015,20 @@ def ai_classify(mentions, llm_cfg):
                 m.stance = r.get("stance", "")
                 m.theme = r.get("theme", "")
                 m.summary = r.get("summary", "")
+                m._ai_ok = True   # genuine AI label — safe to cache
 
-    # Pass 1 — cheap, fast model over everything.
-    _label(mentions, model)
+    # Pass 1 — cheap, fast model over everything not already cached.
+    _label(todo, model)
 
     # Pass 2 — re-judge the high-stakes items with the stronger model: what
     # drives CRITICAL/WARNING alerts (negatives, critiques), everything from
     # watchlist feeds (a scope mistake there pings humans directly), and
     # anything the cheap model wasn't confident about — including posts it
-    # wanted to DROP, since dropping also requires confidence.
+    # wanted to DROP, since dropping also requires confidence. Cached items
+    # never re-escalate: their stored labels already went through this pass
+    # in the run that first labeled them.
     if escalate_model and escalate_model not in ("", "FILL IN"):
-        escalate = [m for m in mentions if
+        escalate = [m for m in todo if
                     (m.relevant and (m.sentiment in ("negative", "mixed")
                                      or m.stance == "substantive_critique"
                                      or m.metrics.get("from_watchlist")
@@ -1008,6 +1037,21 @@ def ai_classify(mentions, llm_cfg):
         if escalate:
             print(f"  [AI] escalating {len(escalate)} item(s) to {escalate_model}.")
             _label(escalate, escalate_model, fallback=False)
+
+    # Persist the labels this run actually bought (post-escalation, AI-only).
+    now = datetime.now(timezone.utc).isoformat()
+    for m in todo:
+        if getattr(m, "_ai_ok", False):
+            cache[f"{m.platform}:{m.id}"] = {
+                "about": m.about, "about_conf": m.about_conf,
+                "sentiment": m.sentiment, "stance": m.stance,
+                "theme": m.theme, "summary": m.summary,
+                "url": m.url, "ts": now}   # url lets apply_retags correct us
+    if len(cache) > 20000:   # keep the file from growing forever
+        cache = dict(sorted(cache.items(),
+                            key=lambda kv: kv[1].get("ts", ""))[-20000:])
+    with open(cache_path, "w") as f:
+        json.dump(cache, f)
     return mentions
 
 
@@ -1247,6 +1291,7 @@ _HEALTH = "health_state.json"    # last health-ping signature (repeat suppressio
 _MENTIONS = "mentions.json"      # running log of every relevant mention (public)
 _NEWS_CLUSTERS = "news_clusters.json"  # cross-run story clusters (pickup accumulates over days)
 _RETAG = "retag_state.json"      # applied human re-tags + precedent examples for the classifier
+_AI_LABELS = "ai_labels.json"    # AI classification cache — labels bought once, reused across runs
 
 
 def _load(path, default):
@@ -1445,6 +1490,20 @@ def apply_retags(config, state_dir="."):
                                           "about": e.get("about", "")})
                 changed += 1
                 break
+        # Human corrections outrank the AI label cache too — otherwise the
+        # cached label resurrects while the post is still in a fetch window.
+        cache = _load(os.path.join(state_dir, _AI_LABELS), {})
+        cache_changed = False
+        for c in cache.values():
+            if c.get("url") == target:
+                if new_sent:
+                    c["sentiment"] = new_sent
+                if new_scope:
+                    c["about"] = new_scope
+                cache_changed = True
+        if cache_changed:
+            with open(os.path.join(state_dir, _AI_LABELS), "w") as f:
+                json.dump(cache, f)
     state["done"] = state["done"][-2000:]
     state["examples"] = state["examples"][-10:]
     with open(os.path.join(state_dir, _RETAG), "w") as f:
