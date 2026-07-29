@@ -259,7 +259,9 @@ sources:
     - Slate
     - The Verge
 llm:
-  enabled: true
+  # Disabled 2026-07-29: API credits exhausted. Flip back to true once
+  # billing is topped up — until then runs use keyword-only classification.
+  enabled: false
   provider: anthropic
   api_key: ''
   # Model for the bulk relevance + sentiment pass (upgraded from Haiku 4.5
